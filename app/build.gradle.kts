@@ -23,6 +23,7 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "0.1.0-dev"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
     }
 
@@ -94,6 +95,9 @@ dependencies {
     "armImplementation"(libs.geckoview.armeabi.v7a)
     "arm64Implementation"(libs.geckoview.arm64.v8a)
     testImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation(libs.ui.test.junit4)
     debugImplementation(libs.ui.test.manifest)

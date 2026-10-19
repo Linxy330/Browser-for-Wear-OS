@@ -6,6 +6,9 @@ kotlin = "2.2.10"
 # 见 Browser_Agent/docs/DECISIONS.md D-002
 geckoview = "158.0.20261007201254"
 junit = "4.13.2"
+androidxTestCore = "1.7.0"
+androidxTestExtJunit = "1.3.0"
+androidxTestRunner = "1.7.0"
 composeBom = "2024.09.00"
 composeMaterial3 = "1.5.6"
 composeFoundation = "1.5.6"
@@ -19,6 +22,9 @@ coreSplashscreen = "1.2.0"
 geckoview-armeabi-v7a = { group = "org.mozilla.geckoview", name = "geckoview-armeabi-v7a", version.ref = "geckoview" }
 geckoview-arm64-v8a = { group = "org.mozilla.geckoview", name = "geckoview-arm64-v8a", version.ref = "geckoview" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-test-core = { group = "androidx.test", name = "core", version.ref = "androidxTestCore" }
+androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestExtJunit" }
+androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }
 play-services-wearable = { group = "com.google.android.gms", name = "play-services-wearable", version.ref = "playServicesWearable" }
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 ui = { group = "androidx.compose.ui", name = "ui" }
