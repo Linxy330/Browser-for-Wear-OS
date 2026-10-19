@@ -1,5 +1,18 @@
 <resources>
     <string name="app_name">Browser for Wear OS</string>
-    <string name="b0_status">B0 build baseline · engine not wired yet</string>
     <string name="abi_label">ABI: %1$s</string>
+    <string name="b1_open_web">Open web</string>
+    <string name="b1_address_title">URL</string>
+    <string name="b1_address_hint">Enter address</string>
+    <string name="b1_go">Go</string>
+    <string name="b1_cancel">Cancel</string>
+    <string name="b1_home">Home</string>
+    <string name="b1_loading">Loading… %1$d%%</string>
+    <string name="b1_ok">OK</string>
+    <string name="b1_auth_user">Username</string>
+    <string name="b1_auth_password">Password</string>
+    <string name="b1_leave_title">Leave page?</string>
+    <string name="b1_leave_message">Unsubmitted form data will be lost.</string>
+    <string name="b1_leave_ok">Leave</string>
+    <string name="b1_stay">Stay</string>
 </resources>

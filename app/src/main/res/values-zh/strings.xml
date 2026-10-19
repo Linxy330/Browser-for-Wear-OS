@@ -1,5 +1,18 @@
 <resources>
     <string name="app_name">Browser for Wear OS</string>
-    <string name="b0_status">B0 构建基线 · 引擎尚未接入</string>
     <string name="abi_label">ABI：%1$s</string>
+    <string name="b1_open_web">打开网页</string>
+    <string name="b1_address_title">网址</string>
+    <string name="b1_address_hint">输入网址</string>
+    <string name="b1_go">前往</string>
+    <string name="b1_cancel">取消</string>
+    <string name="b1_home">主页</string>
+    <string name="b1_loading">加载中… %1$d%%</string>
+    <string name="b1_ok">好</string>
+    <string name="b1_auth_user">用户名</string>
+    <string name="b1_auth_password">密码</string>
+    <string name="b1_leave_title">离开此页？</string>
+    <string name="b1_leave_message">未提交的表单内容将会丢失。</string>
+    <string name="b1_leave_ok">离开</string>
+    <string name="b1_stay">留下</string>
 </resources>
