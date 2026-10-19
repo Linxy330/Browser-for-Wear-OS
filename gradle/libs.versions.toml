@@ -2,6 +2,10 @@
 agp = "9.4.1"
 playServicesWearable = "20.0.1"
 kotlin = "2.2.10"
+# GeckoView 稳定候选（B0 选定；Mozilla 官方 maven，AAR minSdk 26 < 30）。
+# 见 Browser_Agent/docs/DECISIONS.md D-002
+geckoview = "158.0.20261007201254"
+junit = "4.13.2"
 composeBom = "2024.09.00"
 composeMaterial3 = "1.5.6"
 composeFoundation = "1.5.6"
@@ -11,6 +15,10 @@ activityCompose = "1.13.0"
 coreSplashscreen = "1.2.0"
 
 [libraries]
+# 每个 Mozilla AAR 只含单一 ABI，靠 flavor 选择，禁止在同一变体混装两份引擎
+geckoview-armeabi-v7a = { group = "org.mozilla.geckoview", name = "geckoview-armeabi-v7a", version.ref = "geckoview" }
+geckoview-arm64-v8a = { group = "org.mozilla.geckoview", name = "geckoview-arm64-v8a", version.ref = "geckoview" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
 play-services-wearable = { group = "com.google.android.gms", name = "play-services-wearable", version.ref = "playServicesWearable" }
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 ui = { group = "androidx.compose.ui", name = "ui" }

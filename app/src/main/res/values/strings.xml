@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name">Browser for Wear OS</string>
-    <string name="hello_world">Hello, %1$s!</string>
+    <string name="b0_status">B0 build baseline · engine not wired yet</string>
+    <string name="abi_label">ABI: %1$s</string>
 </resources>
