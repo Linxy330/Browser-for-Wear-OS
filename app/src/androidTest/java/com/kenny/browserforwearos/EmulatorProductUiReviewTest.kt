@@ -3,7 +3,9 @@ package com.kenny.browserforwearos
 import android.app.LocaleManager
 import android.os.Build
 import android.os.LocaleList
+import android.os.PowerManager
 import android.os.SystemClock
+import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import androidx.compose.ui.test.SemanticsMatcher
@@ -15,9 +17,10 @@ import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performImeAction
 import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextReplacement
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.SdkSuppress
 import androidx.test.uiautomator.UiDevice
@@ -33,6 +36,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.GeckoSession
 import java.io.File
 import java.util.UUID
 
@@ -44,6 +48,8 @@ class EmulatorProductUiReviewTest : EmulatorProductFixture() {
     private val device by lazy { UiDevice.getInstance(instrumentation) }
     private var previousLocales: LocaleList? = null
     private lateinit var model: BrowserViewModel
+    private var paintBarrier: NativePaintBarrier? = null
+    private var paintSession: GeckoSession? = null
 
     @Before
     fun openRealChineseProductUi() {
@@ -68,6 +74,7 @@ class EmulatorProductUiReviewTest : EmulatorProductFixture() {
         try {
             closeScenario()
         } finally {
+            onMain { paintBarrier?.close(); paintBarrier = null; paintSession = null }
             previousLocales?.let { saved ->
                 onMain { checkNotNull(app.getSystemService(LocaleManager::class.java)).applicationLocales = saved }
             }
@@ -116,9 +123,24 @@ class EmulatorProductUiReviewTest : EmulatorProductFixture() {
         assertEquals(revision, controller.committedRevision.value)
 
         openMenu()
+        recordReader(controller, "before-reader")
         clickAction(R.string.reader_mode)
-        await("Reader UI must obtain a real native article extraction") {
-            controller.pageTools.readerState.value.status == PageTools.ReaderState.Status.READY
+        try {
+            var nextDiagnostic = 0L
+            await("Reader UI must obtain a real native article extraction") {
+                val state = controller.pageTools.readerState.value
+                if (SystemClock.elapsedRealtime() >= nextDiagnostic) {
+                    recordReader(controller, "await-reader")
+                    nextDiagnostic = SystemClock.elapsedRealtime() + 1_000
+                }
+                if (state.status == PageTools.ReaderState.Status.FAILED) {
+                    fail("Native Reader failed: ${recordReader(controller, "reader-failed")}")
+                }
+                state.status == PageTools.ReaderState.Status.READY
+            }
+        } finally {
+            recordReader(controller, "reader-await-finished")
+            if (controller.pageTools.readerState.value.status != PageTools.ReaderState.Status.READY) screenshot("reader-failure")
         }
         val article = checkNotNull(controller.pageTools.readerState.value.article)
         assertEquals(target, article.url)
@@ -227,6 +249,32 @@ class EmulatorProductUiReviewTest : EmulatorProductFixture() {
     private fun assetJson(path: String): JSONObject =
         JSONObject(app.assets.open(path).bufferedReader(Charsets.UTF_8).use { it.readText() })
 
+    private fun recordReader(controller: TabSessionController, phase: String): String {
+        val details = onMain {
+            val activity = scenarioActivity
+            val viewport = activity?.window?.decorView?.let(::findGecko)
+            val state = controller.pageTools.readerState.value
+            // Read this app-owned field for diagnostics without changing public
+            // production API or substituting a lifecycle/engine getter result.
+            val controllerActive = runCatching {
+                TabSessionController::class.java.getDeclaredField("active").apply { isAccessible = true }.getBoolean(controller)
+            }.getOrNull()
+            JSONObject().put("phase", phase).put("status", state.status.name)
+                .put("failure", state.failure?.name ?: JSONObject.NULL)
+                .put("controllerActive", controllerActive ?: JSONObject.NULL)
+                .put("nativeOpen", controller.session.isOpen).put("suspended", controller.suspended)
+                .put("loading", controller.isLoading.value).put("revision", controller.committedRevision.value)
+                .put("activityState", activity?.lifecycle?.currentState?.name ?: "none")
+                .put("windowFocus", activity?.hasWindowFocus() ?: false)
+                .put("interactive", app.getSystemService(PowerManager::class.java)?.isInteractive ?: false)
+                .put("viewportAttached", viewport?.isAttachedToWindow ?: false)
+                .put("viewportSameSession", viewport?.session === controller.session)
+                .put("elapsedRealtimeMs", SystemClock.elapsedRealtime()).toString()
+        }
+        Log.i("EmulatorReaderUi", details)
+        return details
+    }
+
     private fun label(resource: Int): String = onMain { checkNotNull(scenarioActivity).getString(resource) }
 
     private fun action(resource: Int): SemanticsNodeInteraction {
@@ -252,7 +300,14 @@ class EmulatorProductUiReviewTest : EmulatorProductFixture() {
     private fun enterAndSubmit(value: String) {
         scrollTo(hasSetTextAction())
         compose.onNode(hasSetTextAction()).performTextReplacement(value)
-        compose.onNode(hasSetTextAction()).performImeAction()
+        // Observe real paint in the same Main turn as the actual address action,
+        // so a fast title/commit cannot produce a clear-color screenshot/menu tap.
+        compose.onNode(hasSetTextAction()).performSemanticsAction(SemanticsActions.OnImeAction) { action ->
+            assertTrue("The actual address action must accept navigation", action())
+            paintBarrier?.close()
+            paintSession = model.controller.session
+            paintBarrier = NativePaintBarrier(checkNotNull(paintSession), value)
+        }
     }
 
     private fun openMenu() {
@@ -268,6 +323,11 @@ class EmulatorProductUiReviewTest : EmulatorProductFixture() {
         assertNull(controller.error.value)
         await("The production Compose WebScreen must attach the correct native session") {
             onMain { findGecko(checkNotNull(scenarioActivity).window.decorView)?.session === controller.session }
+        }
+        if (onMain { paintSession === controller.session }) {
+            await("The actual page must paint and complete native pixel readback before screenshot or menu input") {
+                onMain { checkNotNull(paintBarrier).isReadyForInput(findGecko(checkNotNull(scenarioActivity).window.decorView)) }
+            }
         }
     }
 

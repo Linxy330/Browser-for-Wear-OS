@@ -2,6 +2,7 @@ package com.kenny.browserforwearos
 
 import android.os.Build
 import android.os.SystemClock
+import android.os.Bundle
 import androidx.core.content.FileProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.kenny.browserforwearos.data.download.PreparedUpload
@@ -38,16 +39,33 @@ class EmulatorUploadLeaseLifetimeTest : EmulatorProductFixture() {
         val original = File(owned, "fixture.bin")
         val bytes = ByteArray(8192) { ((it * 43 + 11) % 256).toByte() }
         var lease: PreparedUpload? = null
+        var paint: NativePaintBarrier? = null
         try {
             assertTrue(owned.mkdirs())
             original.writeBytes(bytes)
             val content = FileProvider.getUriForFile(app, "${app.packageName}.downloads", original)
-            onMain { controller.loadUri(target) }
+            onMain {
+                controller.loadUri(target)
+                paint = NativePaintBarrier(controller.session, target)
+            }
+            var nextDiagnostic = 0L
             await("The form DOM must be usable while its real image response is held open") {
-                controller.title.value == "PRODUCT_UPLOAD_LATE_READY" && controller.isLoading.value &&
-                    control(run).getBoolean("started")
+                if (SystemClock.elapsedRealtime() >= nextDiagnostic) {
+                    nextDiagnostic = SystemClock.elapsedRealtime() + 1_000
+                    val state = JSONObject().put("title", controller.title.value)
+                        .put("loading", controller.isLoading.value)
+                        .put("revision", controller.committedRevision.value)
+                        .put("error", controller.error.value)
+                        .put("resource", runCatching { control(run) }.getOrNull())
+                    instrumentation.sendStatus(0, Bundle().apply { putString("stream", "[upload-lease] $state\n") })
+                }
+                controller.title.value == "PRODUCT_UPLOAD_LATE_READY" && controller.isLoading.value && controller.committedRevision.value == 0L &&
+                    control(run).let { it.getBoolean("started") && !it.getBoolean("released") }
             }
             assertEquals("The first top-level load must still have no successful stop", 0L, controller.committedRevision.value)
+            await("The form must actually paint and accept focus before its first touch") {
+                onMain { checkNotNull(paint).isReadyForInput(checkNotNull(view)) }
+            }
             tapCentre()
             await("An actual file-input touch must produce a native pending file prompt") {
                 controller.pendingPrompt.value is EnginePrompt.File
@@ -60,7 +78,8 @@ class EmulatorUploadLeaseLifetimeTest : EmulatorProductFixture() {
             assertTrue(staged.all(File::isFile))
             onMain { assertTrue(controller.confirmFiles(selected.uris, selected)) }
             await("File selection must update this still-loading DOM without submitting it") {
-                controller.title.value == "PRODUCT_UPLOAD_LATE_SELECTED" && controller.isLoading.value
+                controller.title.value == "PRODUCT_UPLOAD_LATE_SELECTED" && controller.pendingPrompt.value == null &&
+                    controller.isLoading.value && staged.all(File::isFile)
             }
             assertEquals(0L, controller.committedRevision.value)
             assertNull(controller.pendingPrompt.value)
@@ -96,7 +115,10 @@ class EmulatorUploadLeaseLifetimeTest : EmulatorProductFixture() {
             assertArrayEquals("Lease cleanup must not delete the chosen provider source", bytes, original.readBytes())
         } finally {
             runCatching { control(run, release = true) }
-            onMain { controller.close() } // Close native before an exceptional cleanup can unlink its DOM files.
+            onMain {
+                paint?.close()
+                controller.close()
+            } // Close native before an exceptional cleanup can unlink its DOM files.
             lease?.close()
             owned.deleteRecursively()
         }

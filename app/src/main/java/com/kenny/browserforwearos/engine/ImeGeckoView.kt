@@ -2,7 +2,10 @@ package com.kenny.browserforwearos.engine
 
 import android.content.Context
 import android.text.InputType
+import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.ExtractedText
+import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import org.mozilla.geckoview.GeckoSession
@@ -47,7 +50,9 @@ class ImeGeckoView(context: Context) : GeckoView(context) {
         boundSession = session
         val original = session.textInput.delegate
         originalDelegate = original
-        val bridge = object : GeckoSession.TextInputDelegate by original {
+        // Java default methods are not forwarded by Kotlin interface delegation (`by`).
+        // Keep all six Gecko 158 methods explicit, including the IME state updates.
+        val bridge = object : GeckoSession.TextInputDelegate {
             override fun restartInput(session: GeckoSession, reason: Int) {
                 if (!owns(session)) return
                 if (reason == GeckoSession.TextInputDelegate.RESTART_REASON_BLUR) {
@@ -71,6 +76,23 @@ class ImeGeckoView(context: Context) : GeckoView(context) {
                 if (!owns(session)) return
                 cancelShow()
                 original.hideSoftInput(session)
+            }
+
+            override fun updateSelection(
+                session: GeckoSession, selStart: Int, selEnd: Int,
+                compositionStart: Int, compositionEnd: Int,
+            ) {
+                if (owns(session)) original.updateSelection(session, selStart, selEnd, compositionStart, compositionEnd)
+            }
+
+            override fun updateExtractedText(
+                session: GeckoSession, request: ExtractedTextRequest, text: ExtractedText,
+            ) {
+                if (owns(session)) original.updateExtractedText(session, request, text)
+            }
+
+            override fun updateCursorAnchorInfo(session: GeckoSession, info: CursorAnchorInfo) {
+                if (owns(session)) original.updateCursorAnchorInfo(session, info)
             }
         }
         bridgeDelegate = bridge

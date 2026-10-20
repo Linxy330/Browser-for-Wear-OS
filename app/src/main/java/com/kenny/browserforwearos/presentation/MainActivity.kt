@@ -51,6 +51,7 @@ import com.kenny.browserforwearos.engine.EnginePrompt
 import com.kenny.browserforwearos.engine.TabSessionController
 import com.kenny.browserforwearos.engine.DeviceActivityMonitor
 import com.kenny.browserforwearos.engine.ImeGeckoView
+import com.kenny.browserforwearos.engine.PageTools
 import com.kenny.browserforwearos.presentation.theme.BrowserForWearOSTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -108,6 +109,14 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
     var viewport by remember { mutableStateOf<GeckoView?>(null) }
     var incomingText by remember { mutableStateOf<String?>(null) }
     val controller = tabs.firstOrNull { it.id == selected }?.controller
+    val readerState = controller?.pageTools?.readerState?.collectAsState()?.value
+    // Gecko's first extraction waits for native animation frames. Keep the
+    // original display and active document until extraction has completed;
+    // starting from IDLE must not detach it before Reader's LaunchedEffect runs.
+    val extractingReader = screen == Screen.Reader && readerState?.status in setOf(
+        PageTools.ReaderState.Status.IDLE,
+        PageTools.ReaderState.Status.LOADING,
+    )
     val keyboard = LocalSoftwareKeyboardController.current
     val scope = rememberCoroutineScope()
     fun requestZoom(factor: Float?) {
@@ -136,7 +145,9 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
         viewModel.consumeIncoming(request.serial)
     }
     LaunchedEffect(downloadOffer) { if (downloadOffer > 0) screen = Screen.Downloads }
-    LaunchedEffect(screen, selected, ready) { viewModel.setWebVisible(screen == Screen.Web || screen == Screen.Find) }
+    LaunchedEffect(screen, selected, ready, extractingReader) {
+        viewModel.setWebVisible(screen == Screen.Web || screen == Screen.Find || extractingReader)
+    }
     BackHandler(enabled = screen != Screen.Home) {
         when (screen) {
             Screen.Web -> {
@@ -157,7 +168,7 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(stringResource(R.string.restoring)) }
             return@Box
         }
-        if (screen == Screen.Web || screen == Screen.Menu || screen == Screen.Find) {
+        if (screen == Screen.Web || screen == Screen.Menu || screen == Screen.Find || extractingReader) {
             key(controller.tabId) {
                 WebScreen(controller, immersive, screen == Screen.Web, { screen = Screen.Menu }, {
                     returnTo = Screen.Web; screen = Screen.Address

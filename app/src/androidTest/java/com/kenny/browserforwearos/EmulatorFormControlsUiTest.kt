@@ -1,14 +1,19 @@
 package com.kenny.browserforwearos
 
+import android.os.SystemClock
+import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.uiautomator.UiDevice
 import com.kenny.browserforwearos.engine.EnginePrompt
 import com.kenny.browserforwearos.presentation.BrowserViewModel
+import org.json.JSONObject
 import org.junit.Assert.*
+import org.junit.After
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -21,6 +26,7 @@ class EmulatorFormControlsUiTest : EmulatorProductFixture() {
     @get:Rule val compose = createEmptyComposeRule()
     private lateinit var model: BrowserViewModel
     private lateinit var root: View
+    private var paintBarrier: NativePaintBarrier? = null
     private val device by lazy { UiDevice.getInstance(instrumentation) }
 
     @Before fun openBrowser() {
@@ -30,8 +36,19 @@ class EmulatorFormControlsUiTest : EmulatorProductFixture() {
         click(R.string.b1_open_web)
         compose.onNode(hasScrollAction()).performScrollToNode(hasSetTextAction())
         compose.onNode(hasSetTextAction()).performTextReplacement("$base/product/control?type=date")
-        compose.onNode(hasSetTextAction()).performImeAction()
+        // Invoke the same real UI semantics action as performImeAction, then install the
+        // observer in that Main turn. Any reopened session now owns its production delegates,
+        // while asynchronous Gecko navigation/paint callbacks cannot have interleaved yet.
+        compose.onNode(hasSetTextAction()).assert(hasPerformImeAction())
+            .performSemanticsAction(SemanticsActions.OnImeAction) { action ->
+                assertTrue("The actual address IME action must accept navigation", action())
+                observePaint("date")
+            }
         await("Actual date document must commit") { model.controller.title.value == "PRODUCT_CONTROL_date_READY" && !model.controller.isLoading.value }
+    }
+
+    @After fun releasePaintObservation() {
+        onMain { paintBarrier?.close(); paintBarrier = null }
     }
 
     @Test fun dateRejectsStepMismatchThenChangesTheActualDomValue() {
@@ -83,12 +100,32 @@ class EmulatorFormControlsUiTest : EmulatorProductFixture() {
     }
 
     private fun navigate(kind: String) {
-        onMain { assertTrue(model.submitAddress("$base/product/control?type=$kind")) }
+        onMain {
+            assertTrue(model.submitAddress("$base/product/control?type=$kind"))
+            observePaint(kind)
+        }
         await("Expected real $kind document") { model.controller.title.value == "PRODUCT_CONTROL_${kind}_READY" && !model.controller.isLoading.value }
     }
     private fun openPrompt(kind: String) {
-        await("A real GeckoView must attach") { onMain { findGecko(root)?.session === model.controller.session } }
-        Thread.sleep(250)
+        var lastDiagnosticAt = Long.MIN_VALUE
+        await("The real $kind document must paint and its GeckoView must own input focus") {
+            onMain {
+                val barrier = checkNotNull(paintBarrier)
+                val view = findGecko(root)
+                var ready = false
+                try {
+                    ready = barrier.isReadyForInput(view)
+                    ready
+                } finally {
+                    val now = SystemClock.uptimeMillis()
+                    if (ready || lastDiagnosticAt == Long.MIN_VALUE || now - lastDiagnosticAt >= 1_000) {
+                        lastDiagnosticAt = now
+                        Log.i("EmulatorFormPaint", JSONObject(barrier.diagnostic(view))
+                            .put("kind", kind).put("ready", ready).put("uptimeMs", now).toString())
+                    }
+                }
+            }
+        }
         val point = onMain {
             val view = checkNotNull(findGecko(root))
             val position = IntArray(2); view.getLocationOnScreen(position)
@@ -96,6 +133,10 @@ class EmulatorFormControlsUiTest : EmulatorProductFixture() {
         }
         assertTrue(device.click(point.first, point.second))
         await("Actual $kind input must request native UI") { model.controller.pendingPrompt.value != null }
+    }
+    private fun observePaint(kind: String) {
+        paintBarrier?.close()
+        paintBarrier = NativePaintBarrier(model.controller.session, "$base/product/control?type=$kind")
     }
     private fun replaceValue(value: String) {
         compose.onNode(hasScrollAction()).performScrollToNode(hasSetTextAction())

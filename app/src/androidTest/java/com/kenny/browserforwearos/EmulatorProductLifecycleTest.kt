@@ -133,7 +133,7 @@ class EmulatorProductLifecycleTest : EmulatorProductFixture() {
 
         onMain {
             val productDelegate = checkNotNull(oldSession.contentDelegate)
-            oldSession.contentDelegate = object : GeckoSession.ContentDelegate by productDelegate {
+            oldSession.contentDelegate = object : ForwardingContentDelegate(productDelegate) {
                 override fun onCrash(session: GeckoSession) {
                     nativeCrashCallbacks.incrementAndGet()
                     record("NATIVE_ON_CRASH")

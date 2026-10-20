@@ -168,7 +168,7 @@ class EmulatorPageToolsTest {
                 helper.attach(view!!, engine.session)
                 view!!.setOnTouchListener { _, event -> helper.observeTouch(event); false }
                 val delegate = checkNotNull(engine.session.contentDelegate)
-                engine.session.contentDelegate = object : GeckoSession.ContentDelegate by delegate {
+                engine.session.contentDelegate = object : ForwardingContentDelegate(delegate) {
                     override fun onFirstContentfulPaint(session: GeckoSession) {
                         delegate.onFirstContentfulPaint(session)
                         if (engine.url.value != target || firstTouch.get() != null) return
