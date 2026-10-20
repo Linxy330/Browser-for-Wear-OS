@@ -1,0 +1,14 @@
+<resources>
+    <string name="data_save_failed">Could not save browsing data. Check available storage.</string>
+    <string name="data_corrupt_recovered">Browsing data was damaged. The original file was isolated and an empty profile was opened.</string>
+    <string name="data_read_failed">Could not read browsing data. A blank tab was opened.</string>
+    <string name="data_invalid_address">Enter a valid address or search. Only HTTP and HTTPS addresses are supported.</string>
+    <string name="data_tab_limit">Up to 3 tabs. Close a tab before opening another.</string>
+    <string name="data_popup_tab_limit">Up to 3 tabs. New window cancelled; close a tab first.</string>
+    <string name="data_bookmark_unavailable">Open a web page before adding a bookmark.</string>
+    <string name="data_bookmark_exists">This page is already bookmarked.</string>
+    <string name="data_bookmark_added">Bookmark added.</string>
+    <string name="data_history_cleared">Browsing history cleared.</string>
+    <string name="data_site_data_cleared">Website data cleared. Reloaded websites will require signing in again.</string>
+    <string name="data_site_data_failed">Could not clear website data. Try again.</string>
+</resources>

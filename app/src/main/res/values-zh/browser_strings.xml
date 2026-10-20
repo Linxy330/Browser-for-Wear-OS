@@ -1,0 +1,36 @@
+<resources>
+    <string name="restoring">正在恢复标签…</string>
+    <string name="continue_browsing">继续浏览</string>
+    <string name="bookmarks">书签</string>
+    <string name="history">历史</string>
+    <string name="settings">设置</string>
+    <string name="edit_address">网址 / 搜索</string>
+    <string name="tools">菜单</string>
+    <string name="back_to_page">返回网页</string>
+    <string name="secure_connection">引擎已验证连接</string>
+    <string name="unconfirmed_connection">连接安全性未确认</string>
+    <string name="go_back">后退</string>
+    <string name="go_forward">前进</string>
+    <string name="stop">停止加载</string>
+    <string name="reload">刷新</string>
+    <string name="new_tab">新建标签</string>
+    <string name="tabs">标签</string>
+    <string name="tabs_count">标签（%1$d / 3）</string>
+    <string name="empty_tab">空白标签</string>
+    <string name="close_tab">关闭标签</string>
+    <string name="add_bookmark">收藏当前网页</string>
+    <string name="zoom_in">放大</string>
+    <string name="zoom_out">缩小</string>
+    <string name="fit_screen">恢复适屏</string>
+    <string name="immersive">沉浸浏览</string>
+    <string name="no_bookmarks">暂无书签</string>
+    <string name="no_history">暂无浏览历史</string>
+    <string name="edit_title">修改标题</string>
+    <string name="delete">删除</string>
+    <string name="clear_history">清空历史</string>
+    <string name="search_engine">搜索引擎</string>
+    <string name="clear_site_data">清除网站数据</string>
+    <string name="clear_site_warning">此操作清除所有标签共享的 Cookie、缓存与网站存储，会退出网站登录。书签与历史保留。</string>
+    <string name="clear_confirm">确认清除网站数据</string>
+    <string name="voice_input">语音输入</string>
+</resources>

@@ -1,8 +1,13 @@
 package com.kenny.browserforwearos.engine
 
 import android.content.Context
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.UiThread
+import com.kenny.browserforwearos.R
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -10,449 +15,598 @@ import org.mozilla.geckoview.AllowOrDeny
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoSession
+import org.mozilla.geckoview.GeckoSessionSettings
+import org.mozilla.geckoview.PanZoomController
+import org.mozilla.geckoview.ScreenLength
 import org.mozilla.geckoview.WebRequestError
+import org.mozilla.geckoview.WebResponse
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicInteger
 
-/** 新标签 ID 生成；B3 三标签管理复用。 */
 fun newTabId(): String = "tab-" + UUID.randomUUID().toString()
 
-/**
- * 单个标签的引擎会话控制器：封装 GeckoSession 与全部委托回调，
- * 以 StateFlow 暴露给 UI（规范 3.1：引擎回调是状态的唯一来源）。
- *
- * 线程约定：GeckoView 委托回调均在主线程；@UiThread 方法仅可主线程调用。
- * 关闭后（[close]）忽略一切迟到回调，防止过期异步结果覆盖当前页面（规范 3.2 规则 3）。
- */
+/** One logical tab. Its GeckoSession can be closed for bounded background suspension. */
 @UiThread
 class TabSessionController(
     context: Context,
     val tabId: String = newTabId(),
+    initiallyOpen: Boolean = true,
 ) {
-    private val appContext: Context = context.applicationContext
-
+    private val appContext = context.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val runtime: GeckoRuntime by lazy { GeckoRuntimeHolder.runtime(appContext) }
+    val session: GeckoSession = GeckoSession(
+        GeckoSessionSettings.Builder()
+            .userAgentMode(GeckoSessionSettings.USER_AGENT_MODE_MOBILE)
+            .viewportMode(GeckoSessionSettings.VIEWPORT_MODE_MOBILE)
+            .suspendMediaWhenInactive(true)
+            .build(),
+    )
 
-    val session: GeckoSession = GeckoSession()
-
-    // ---- 引擎回调产生的真实状态 ----------------------------------------
     private val _url = MutableStateFlow("")
     val url: StateFlow<String> = _url.asStateFlow()
-
     private val _title = MutableStateFlow("")
     val title: StateFlow<String> = _title.asStateFlow()
-
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
-
     private val _progress = MutableStateFlow(0)
     val progress: StateFlow<Int> = _progress.asStateFlow()
-
     private val _canGoBack = MutableStateFlow(false)
     val canGoBack: StateFlow<Boolean> = _canGoBack.asStateFlow()
-
     private val _canGoForward = MutableStateFlow(false)
     val canGoForward: StateFlow<Boolean> = _canGoForward.asStateFlow()
-
-    /** 由引擎 SecurityInformation 确认的安全状态，不仅凭 https:// 前缀。 */
     private val _isSecure = MutableStateFlow(false)
     val isSecure: StateFlow<Boolean> = _isSecure.asStateFlow()
-
-    /** 一次性用户反馈（弹窗拦截、未支持类型说明等）；UI 消费后置空。 */
+    private val _error = MutableStateFlow<String?>(null)
+    val error: StateFlow<String?> = _error.asStateFlow()
+    private val _fullScreen = MutableStateFlow(false)
+    val fullScreen: StateFlow<Boolean> = _fullScreen.asStateFlow()
     private val _feedback = MutableStateFlow<String?>(null)
     val feedback: StateFlow<String?> = _feedback.asStateFlow()
-
-    /** 待用户应答的引擎提示（alert/confirm/prompt/auth/选择框/上传）。 */
     private val _pendingPrompt = MutableStateFlow<EnginePrompt?>(null)
     val pendingPrompt: StateFlow<EnginePrompt?> = _pendingPrompt.asStateFlow()
 
-    /** 会话是否已关闭；关闭后所有委托回调短路。 */
-    @Volatile
+    /** Successful top-level HTTP(S) loads only; revision also changes for same-URL reloads. */
+    private val _committedUrl = MutableStateFlow("")
+    val committedUrl: StateFlow<String> = _committedUrl.asStateFlow()
+    private val _committedRevision = MutableStateFlow(0L)
+    val committedRevision: StateFlow<Long> = _committedRevision.asStateFlow()
+
+    /** The factory must return an unopened session; Gecko opens and navigates it. */
+    var onNewTabRequested: ((String) -> GeckoSession?)? = null
+    var onCloseRequested: (() -> Unit)? = null
+    /** The UI releases its GeckoView synchronously before native session closure. */
+    var onBeforeSuspend: (() -> Unit)? = null
+
     var closed: Boolean = false
         private set
+    private val _suspended = MutableStateFlow(false)
+    val suspendedState: StateFlow<Boolean> = _suspended.asStateFlow()
+    val suspended: Boolean get() = _suspended.value
+    private var generation = 0L
+    private var active = true
+    private var stoppedByUser = false
+    private var authorizedWindow: Pair<String, Long>? = null
+    // Kept only in memory. Never serialize form/POST state or replay it during resume.
+    private var lastSessionState: GeckoSession.SessionState? = null
 
     init {
-        session.open(runtime)
-        session.navigationDelegate = NavigationHandler()
-        session.progressDelegate = ProgressHandler()
-        session.contentDelegate = ContentHandler()
-        session.promptDelegate = PromptHandler()
+        checkMainThread()
+        installDelegates()
+        if (initiallyOpen) session.open(runtime)
+    }
+
+    private fun checkMainThread() {
+        check(Looper.myLooper() == Looper.getMainLooper()) { "TabSessionController requires the main thread" }
+    }
+
+    private fun installDelegates() {
+        val epoch = generation
+        session.navigationDelegate = NavigationHandler(epoch)
+        session.progressDelegate = ProgressHandler(epoch)
+        session.contentDelegate = ContentHandler(epoch)
+        session.promptDelegate = PromptHandler(epoch)
         session.permissionDelegate = PermissionHandler()
     }
 
-    // ---- 引擎操作 --------------------------------------------------------
+    private fun current(epoch: Long): Boolean = !closed && !suspended && epoch == generation
+    private fun canOperate(): Boolean = !closed && !suspended && session.isOpen
+
+    private fun resetLoadState() {
+        dismissPrompt()
+        _error.value = null
+        _isSecure.value = false
+        _fullScreen.value = false
+        stoppedByUser = false
+        authorizedWindow = null
+    }
 
     fun loadUri(uri: String) {
+        checkMainThread()
         if (closed) return
+        reopen(loadLastPage = false)
+        if (!canOperate()) return
+        resetLoadState()
         session.loadUri(uri)
     }
 
     fun reload() {
+        checkMainThread()
         if (closed) return
-        session.reload()
+        val wasSuspended = suspended
+        resumePage()
+        if (!canOperate() || wasSuspended) return
+        val retryUri = _url.value.takeIf { _error.value != null && isWebUri(it) }
+        resetLoadState()
+        if (retryUri != null) session.loadUri(retryUri) else session.reload()
     }
 
     fun stop() {
-        if (closed) return
+        checkMainThread()
+        if (!canOperate()) return
+        stoppedByUser = true
+        _isLoading.value = false
         session.stop()
     }
 
     fun goBack() {
-        if (closed) return
+        checkMainThread()
+        if (!canOperate() || !_canGoBack.value) return
+        resetLoadState()
         session.goBack()
     }
 
     fun goForward() {
-        if (closed) return
+        checkMainThread()
+        if (!canOperate() || !_canGoForward.value) return
+        resetLoadState()
         session.goForward()
     }
 
-    /**
-     * 可见性驱动的引擎暂停（规范 3.2 规则 6 / F12）。
-     * B1 真机验证 setActive(false) 的实际脚本/网络/媒体行为，不能当作默认暂停证明。
-     */
-    fun setActive(active: Boolean) {
-        if (closed) return
-        session.setActive(active)
+    fun scrollBy(pixels: Float) {
+        checkMainThread()
+        if (!canOperate() || !pixels.isFinite()) return
+        session.panZoomController.scrollBy(
+            ScreenLength.zero(), ScreenLength.fromPixels(pixels.toDouble()),
+            PanZoomController.SCROLL_BEHAVIOR_AUTO,
+        )
     }
 
-    /** 关闭标签：释放 Session；不关闭 Runtime（进程级单例，规范 3.2 规则 2）。 */
-    fun close() {
+    fun exitFullScreen() {
+        checkMainThread()
+        if (!canOperate()) return
+        session.exitFullScreen()
+        _fullScreen.value = false
+    }
+
+    fun setActive(active: Boolean) {
+        checkMainThread()
         if (closed) return
-        closed = true
-        _pendingPrompt.value?.let { pending ->
-            runCatching { pending.geckoResult.complete(pending.basePrompt.dismiss()) }
+        this.active = active
+        if (!canOperate()) return
+        if (active) {
+            session.setActive(true)
+            session.setFocused(true)
+        } else {
+            session.setFocused(false)
+            session.setActive(false)
+            session.flushSessionState()
+            dismissPrompt()
         }
-        _pendingPrompt.value = null
+    }
+
+    /** Call after a bounded inactive grace period, after detaching its GeckoView. */
+    fun suspendPage() {
+        checkMainThread()
+        if (closed || suspended || !session.isOpen) return
+        setActive(false)
+        onBeforeSuspend?.invoke()
+        _suspended.value = true
+        generation++
+        authorizedWindow = null
+        _isLoading.value = false
+        _isSecure.value = false
+        _fullScreen.value = false
+        _canGoBack.value = false
+        _canGoForward.value = false
         session.close()
     }
 
-    // ---- Prompt 应答（UI 从 pendingPrompt 收集后调用） --------------------
+    /** Reopens the same Java session and performs a safe GET of the last committed URL. */
+    fun resumePage() {
+        checkMainThread()
+        reopen(loadLastPage = true)
+    }
+
+    private fun reopen(loadLastPage: Boolean) {
+        if (closed || !suspended) return
+        _suspended.value = false
+        generation++
+        installDelegates()
+        session.open(runtime)
+        session.setActive(active)
+        session.setFocused(active)
+        val previous = _committedUrl.value
+        if (loadLastPage && isWebUri(previous)) {
+            resetLoadState()
+            session.loadUri(previous)
+        }
+        // SessionState restore can replay POST or restore private form values. Deliberately
+        // use a fresh GET: hibernation does not promise pending forms or back-stack recovery.
+        lastSessionState = null
+    }
+
+    fun close() {
+        checkMainThread()
+        if (closed) return
+        dismissPrompt()
+        onBeforeSuspend?.invoke()
+        closed = true
+        generation++
+        onNewTabRequested = null
+        onCloseRequested = null
+        onBeforeSuspend = null
+        authorizedWindow = null
+        lastSessionState = null
+        if (session.isOpen) session.close()
+    }
+
+    private fun completePrompt(pending: EnginePrompt, response: () -> GeckoSession.PromptDelegate.PromptResponse) {
+        pending.basePrompt.setDelegate(null)
+        runCatching { pending.geckoResult.complete(response()) }
+            .onFailure { Log.w(TAG, "Prompt completion failed") }
+    }
 
     fun dismissPrompt() {
+        checkMainThread()
         val pending = _pendingPrompt.value ?: return
         _pendingPrompt.value = null
-        runCatching { pending.geckoResult.complete(pending.basePrompt.dismiss()) }
-            .onFailure { Log.w(TAG, "dismissPrompt failed", it) }
+        completePrompt(pending) { pending.basePrompt.dismiss() }
     }
 
     fun confirmButton(positive: Boolean) {
+        checkMainThread()
         val pending = _pendingPrompt.value as? EnginePrompt.Confirm ?: return
         _pendingPrompt.value = null
-        val type = if (positive) {
-            GeckoSession.PromptDelegate.ButtonPrompt.Type.POSITIVE
-        } else {
-            GeckoSession.PromptDelegate.ButtonPrompt.Type.NEGATIVE
-        }
-        runCatching { pending.geckoResult.complete(pending.prompt.confirm(type)) }
-            .onFailure { Log.w(TAG, "confirmButton failed", it) }
+        val type = if (positive) GeckoSession.PromptDelegate.ButtonPrompt.Type.POSITIVE
+        else GeckoSession.PromptDelegate.ButtonPrompt.Type.NEGATIVE
+        completePrompt(pending) { pending.prompt.confirm(type) }
     }
 
     fun confirmText(text: String) {
+        checkMainThread()
         val pending = _pendingPrompt.value as? EnginePrompt.Text ?: return
         _pendingPrompt.value = null
-        runCatching { pending.geckoResult.complete(pending.prompt.confirm(text)) }
-            .onFailure { Log.w(TAG, "confirmText failed", it) }
+        completePrompt(pending) { pending.prompt.confirm(text) }
     }
 
     fun confirmAuth(user: String, password: String) {
+        checkMainThread()
         val pending = _pendingPrompt.value as? EnginePrompt.Auth ?: return
         _pendingPrompt.value = null
-        runCatching { pending.geckoResult.complete(pending.prompt.confirm(user, password)) }
-            .onFailure { Log.w(TAG, "confirmAuth failed", it) }
+        completePrompt(pending) { pending.prompt.confirm(user, password) }
     }
 
     fun confirmChoice(choice: GeckoSession.PromptDelegate.ChoicePrompt.Choice) {
+        checkMainThread()
         val pending = _pendingPrompt.value as? EnginePrompt.Choice ?: return
         _pendingPrompt.value = null
-        runCatching { pending.geckoResult.complete(pending.prompt.confirm(choice)) }
-            .onFailure { Log.w(TAG, "confirmChoice failed", it) }
+        completePrompt(pending) { pending.prompt.confirm(choice) }
     }
 
-    /** 已确认的 BeforeUnload（离开页面）。 */
+    fun confirmChoices(choices: Array<GeckoSession.PromptDelegate.ChoicePrompt.Choice>) {
+        checkMainThread()
+        val pending = _pendingPrompt.value as? EnginePrompt.Choice ?: return
+        if (pending.prompt.type != GeckoSession.PromptDelegate.ChoicePrompt.Type.MULTIPLE) return
+        _pendingPrompt.value = null
+        completePrompt(pending) { pending.prompt.confirm(choices.distinctBy { it.id }.toTypedArray()) }
+    }
+
     fun confirmLeave() {
+        checkMainThread()
         val pending = _pendingPrompt.value as? EnginePrompt.BeforeUnload ?: return
         _pendingPrompt.value = null
-        runCatching { pending.geckoResult.complete(pending.prompt.confirm(AllowOrDeny.ALLOW)) }
-            .onFailure { Log.w(TAG, "confirmLeave failed", it) }
+        completePrompt(pending) { pending.prompt.confirm(AllowOrDeny.ALLOW) }
     }
 
     fun consumeFeedback() {
+        checkMainThread()
         _feedback.value = null
     }
 
-    private fun notifyFeedback(message: String) {
-        Log.i(TAG, "feedback: $message")
-        _feedback.value = message
+    /** Initializes restored list labels without loading a page or recording a visit. */
+    fun seedMetadata(url: String, title: String) {
+        checkMainThread()
+        if (closed || _committedRevision.value != 0L || _isLoading.value || _url.value.isNotEmpty()) return
+        if (!isWebUri(url)) return
+        _url.value = url
+        _title.value = title
     }
 
-    // ---- 委托实现 --------------------------------------------------------
+    private fun notifyFeedback(resource: Int) {
+        _feedback.value = appContext.getString(resource)
+    }
 
-    private inner class NavigationHandler : GeckoSession.NavigationDelegate {
+    private fun promptOrigin(uri: String = _url.value): String =
+        runCatching { Uri.parse(uri).host }.getOrNull()
+            ?.takeIf { it.isNotBlank() } ?: appContext.getString(R.string.engine_unknown_origin)
+
+    private fun isWebUri(uri: String): Boolean = runCatching {
+        val parsed = Uri.parse(uri)
+        parsed.scheme?.lowercase() in setOf("http", "https") && !parsed.host.isNullOrBlank()
+    }.getOrDefault(false)
+
+    private fun displayUrl(uri: String): String =
+        if (uri.equals("about:blank", ignoreCase = true) || uri.startsWith("about:blank#", ignoreCase = true)) "" else uri
+
+    private inner class NavigationHandler(private val epoch: Long) : GeckoSession.NavigationDelegate {
         override fun onLocationChange(
-            session: GeckoSession,
-            url: String?,
+            session: GeckoSession, url: String?,
             permissions: List<GeckoSession.PermissionDelegate.ContentPermission>,
             hasUserGesture: Boolean,
         ) {
-            if (closed || url == null) return
-            _url.value = url
+            if (!current(epoch) || url == null) return
+            _url.value = displayUrl(url)
         }
 
         override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
-            if (closed) return
-            _canGoBack.value = canGoBack
+            if (current(epoch)) _canGoBack.value = canGoBack
         }
 
         override fun onCanGoForward(session: GeckoSession, canGoForward: Boolean) {
-            if (closed) return
-            _canGoForward.value = canGoForward
+            if (current(epoch)) _canGoForward.value = canGoForward
         }
 
         override fun onLoadRequest(
-            session: GeckoSession,
-            request: GeckoSession.NavigationDelegate.LoadRequest,
+            session: GeckoSession, request: GeckoSession.NavigationDelegate.LoadRequest,
         ): GeckoResult<AllowOrDeny> {
-            if (closed) return GeckoResult.deny()
+            if (!current(epoch)) return GeckoResult.deny()
             val uri = request.uri
-            val scheme = when {
-                uri.contains("://") -> uri.substringBefore("://").lowercase()
-                uri.startsWith("about:") -> "about"
-                uri.startsWith("data:") -> "data"
-                uri.startsWith("blob:") -> "blob"
-                else -> ""
+            val scheme = runCatching { Uri.parse(uri).scheme?.lowercase() }.getOrNull()
+            if (scheme !in setOf("http", "https", "about", "blob", "data")) {
+                notifyFeedback(R.string.engine_external_link_unsupported)
+                return GeckoResult.deny()
             }
-            return when (scheme) {
-                "http", "https", "about", "blob", "data" -> GeckoResult.allow()
-                // P0 明确分支：特殊协议不执行，反馈用户（规范 4.3/4.4）
-                "intent", "mailto", "tel", "sms", "geo", "market", "file", "javascript" -> {
-                    notifyFeedback("此设备暂不支持在网页中打开 $scheme: 链接")
-                    GeckoResult.deny()
+            if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) {
+                if (!request.hasUserGesture || onNewTabRequested == null) {
+                    notifyFeedback(R.string.engine_popup_blocked)
+                    return GeckoResult.deny()
                 }
-                else -> {
-                    notifyFeedback("已阻止未支持的链接类型：$uri")
-                    GeckoResult.deny()
-                }
+                authorizedWindow = uri to (SystemClock.elapsedRealtime() + WINDOW_REQUEST_TTL_MS)
             }
+            return GeckoResult.allow()
         }
 
-        override fun onNewSession(
-            session: GeckoSession,
-            uri: String,
-        ): GeckoResult<GeckoSession> {
-            if (closed) return GeckoResult.fromValue(null)
-            // P0：站点自动弹窗默认拦截并反馈；新窗口转标签在 B3 标签体系实现（规范 4.4）
-            notifyFeedback("已拦截站点弹窗")
-            return GeckoResult.fromValue(null)
+        override fun onNewSession(session: GeckoSession, uri: String): GeckoResult<GeckoSession> {
+            if (!current(epoch)) return GeckoResult.fromValue(null)
+            val authorized = authorizedWindow
+            authorizedWindow = null
+            if (authorized == null || authorized.first != uri || authorized.second < SystemClock.elapsedRealtime()) {
+                notifyFeedback(R.string.engine_popup_blocked)
+                return GeckoResult.fromValue(null)
+            }
+            val created = onNewTabRequested?.invoke(uri)
+            if (created?.isOpen == true) {
+                Log.w(TAG, "New-window factory returned an already open session")
+                return GeckoResult.fromValue(null)
+            }
+            return GeckoResult.fromValue(created)
         }
 
         override fun onLoadError(
-            session: GeckoSession,
-            uri: String?,
-            error: WebRequestError,
+            session: GeckoSession, uri: String?, error: WebRequestError,
         ): GeckoResult<String> {
-            if (closed) return GeckoResult.fromValue(null)
-            // 返回 null → 引擎显示内置错误页（含 TLS 失败页，规范 F11 基线）
-            Log.w(TAG, "load error uri=$uri category=${error.category} code=${error.code}")
+            if (!current(epoch)) return GeckoResult.fromValue(null)
+            _isLoading.value = false
+            _isSecure.value = false
+            _fullScreen.value = false
+            dismissPrompt()
+            val resource = when {
+                error.category == WebRequestError.ERROR_CATEGORY_SECURITY -> R.string.engine_error_certificate
+                error.code == WebRequestError.ERROR_UNKNOWN_HOST -> R.string.engine_error_dns
+                error.code == WebRequestError.ERROR_OFFLINE -> R.string.engine_error_offline
+                error.code == WebRequestError.ERROR_NET_TIMEOUT -> R.string.engine_error_timeout
+                else -> R.string.engine_error_load
+            }
+            _error.value = appContext.getString(resource)
+            // Neither URI, query, credentials, certificate details nor prompt contents enter logs.
+            Log.w(TAG, "Load failed category=${error.category} code=${error.code}")
+            // UI presents the error state. No certificate exception or bypass navigation exists.
             return GeckoResult.fromValue(null)
         }
     }
 
-    private inner class ProgressHandler : GeckoSession.ProgressDelegate {
+    private inner class ProgressHandler(private val epoch: Long) : GeckoSession.ProgressDelegate {
         override fun onPageStart(session: GeckoSession, url: String) {
-            if (closed) return
-            _isLoading.value = true
+            if (!current(epoch)) return
+            resetLoadState()
+            _isLoading.value = displayUrl(url).isNotEmpty()
             _progress.value = 0
-            _url.value = url
+            _url.value = displayUrl(url)
+            _title.value = ""
+            session.setActive(active)
+            session.setFocused(active)
         }
 
         override fun onPageStop(session: GeckoSession, success: Boolean) {
-            if (closed) return
+            if (!current(epoch)) return
             _isLoading.value = false
             _progress.value = 100
+            if (success && _error.value == null && isWebUri(_url.value)) {
+                _committedUrl.value = _url.value
+                _committedRevision.value++
+            } else if (!success && !stoppedByUser && _error.value == null) {
+                _isSecure.value = false
+                _error.value = appContext.getString(R.string.engine_error_load)
+            }
         }
 
         override fun onProgressChange(session: GeckoSession, progress: Int) {
-            if (closed) return
-            _progress.value = progress
+            if (current(epoch)) _progress.value = progress.coerceIn(0, 100)
         }
 
         override fun onSecurityChange(
-            session: GeckoSession,
-            securityInfo: GeckoSession.ProgressDelegate.SecurityInformation,
+            session: GeckoSession, securityInfo: GeckoSession.ProgressDelegate.SecurityInformation,
         ) {
-            if (closed) return
-            _isSecure.value = securityInfo.isSecure && !securityInfo.isException
+            if (current(epoch)) {
+                _isSecure.value = _error.value == null && securityInfo.isSecure && !securityInfo.isException
+            }
+        }
+
+        override fun onSessionStateChange(session: GeckoSession, sessionState: GeckoSession.SessionState) {
+            if (current(epoch)) lastSessionState = GeckoSession.SessionState(sessionState)
         }
     }
 
-    private inner class ContentHandler : GeckoSession.ContentDelegate {
+    private inner class ContentHandler(private val epoch: Long) : GeckoSession.ContentDelegate {
         override fun onTitleChange(session: GeckoSession, title: String?) {
-            if (closed) return
-            _title.value = title.orEmpty()
+            if (current(epoch)) _title.value = title.orEmpty().takeUnless { it.equals("about:blank", ignoreCase = true) }.orEmpty()
         }
 
         override fun onCrash(session: GeckoSession) {
-            if (closed) return
+            if (!current(epoch)) return
+            dismissPrompt()
             _isLoading.value = false
-            notifyFeedback("页面进程崩溃，已停止该页")
+            _isSecure.value = false
+            _fullScreen.value = false
+            _error.value = appContext.getString(R.string.engine_error_crash)
         }
 
         override fun onKill(session: GeckoSession) {
-            if (closed) return
+            if (!current(epoch)) return
+            dismissPrompt()
             _isLoading.value = false
-            notifyFeedback("页面被系统回收，返回后重新加载")
+            _isSecure.value = false
+            _fullScreen.value = false
+            _error.value = appContext.getString(R.string.engine_error_reclaimed)
         }
 
         override fun onFocusRequest(session: GeckoSession) {
-            // 网页请求焦点：保持当前焦点所有者策略，B2 细化
+            if (current(epoch) && active) session.setFocused(true)
         }
 
         override fun onCloseRequest(session: GeckoSession) {
-            if (closed) return
-            // window.close()：B3 标签体系处理关闭请求
-            notifyFeedback("网页请求关闭此标签")
+            if (current(epoch)) onCloseRequested?.invoke()
+        }
+
+        override fun onFullScreen(session: GeckoSession, fullScreen: Boolean) {
+            if (current(epoch)) _fullScreen.value = fullScreen
+        }
+
+        override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
+            runCatching { response.body?.close() }
+            if (!current(epoch)) return
+            _isLoading.value = false
+            notifyFeedback(R.string.engine_download_unsupported)
         }
     }
 
     private inner class PermissionHandler : GeckoSession.PermissionDelegate {
         override fun onAndroidPermissionsRequest(
-            session: GeckoSession,
-            permissions: Array<out String>?,
-            callback: GeckoSession.PermissionDelegate.Callback,
-        ) {
-            // P0：定位/麦克风/摄像头等一律拒绝（规范 4.4）
-            callback.reject()
-        }
+            session: GeckoSession, permissions: Array<out String>?, callback: GeckoSession.PermissionDelegate.Callback,
+        ) = callback.reject()
 
         override fun onContentPermissionRequest(
-            session: GeckoSession,
-            permission: GeckoSession.PermissionDelegate.ContentPermission,
-        ): GeckoResult<Int> {
-            return GeckoResult.fromValue(GeckoSession.PermissionDelegate.ContentPermission.VALUE_DENY)
-        }
+            session: GeckoSession, permission: GeckoSession.PermissionDelegate.ContentPermission,
+        ): GeckoResult<Int> = GeckoResult.fromValue(GeckoSession.PermissionDelegate.ContentPermission.VALUE_DENY)
 
         override fun onMediaPermissionRequest(
-            session: GeckoSession,
-            uri: String,
+            session: GeckoSession, uri: String,
             video: Array<out GeckoSession.PermissionDelegate.MediaSource>?,
             audio: Array<out GeckoSession.PermissionDelegate.MediaSource>?,
             callback: GeckoSession.PermissionDelegate.MediaCallback,
-        ) {
-            callback.reject()
-        }
+        ) = callback.reject()
     }
 
-    private inner class PromptHandler : GeckoSession.PromptDelegate {
-        private fun <T : EnginePrompt> queue(create: (GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) -> T): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
+    private inner class PromptHandler(private val epoch: Long) : GeckoSession.PromptDelegate {
+        private fun queue(
+            create: (GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) -> EnginePrompt,
+        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
             val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
-            if (closed) {
-                _pendingPrompt.value = null
-                return GeckoResult.fromValue(null)
-            }
-            _pendingPrompt.value = create(result)
+            val pending = create(result)
+            if (!current(epoch) || !active) return GeckoResult.fromValue(pending.basePrompt.dismiss())
+            dismissPrompt()
+            pending.origin = promptOrigin((pending as? EnginePrompt.Auth)?.prompt?.authOptions?.uri ?: _url.value)
+            pending.basePrompt.setDelegate(object : GeckoSession.PromptDelegate.PromptInstanceDelegate {
+                override fun onPromptDismiss(prompt: GeckoSession.PromptDelegate.BasePrompt) {
+                    if (_pendingPrompt.value !== pending) return
+                    _pendingPrompt.value = null
+                    prompt.setDelegate(null)
+                    runCatching { result.complete(null) }
+                }
+
+                override fun onPromptUpdate(prompt: GeckoSession.PromptDelegate.BasePrompt) {
+                    // Never keep a UI response bound to a superseded engine request.
+                    if (_pendingPrompt.value === pending) dismissPrompt()
+                }
+            })
+            result.setCancellationDelegate(object : GeckoResult.CancellationDelegate {
+                override fun cancel(): GeckoResult<Boolean> {
+                    val cancelled = GeckoResult<Boolean>(mainHandler)
+                    val finishCancellation = Runnable {
+                        if (_pendingPrompt.value === pending) {
+                            _pendingPrompt.value = null
+                            pending.basePrompt.setDelegate(null)
+                            runCatching { pending.basePrompt.dismiss() }
+                        }
+                        // The caller owns cancellation of result; do not complete it recursively.
+                        cancelled.complete(true)
+                    }
+                    if (Looper.myLooper() == Looper.getMainLooper()) finishCancellation.run()
+                    else mainHandler.post(finishCancellation)
+                    return cancelled
+                }
+            })
+            _pendingPrompt.value = pending
             return result
         }
 
-        override fun onAlertPrompt(
-            session: GeckoSession,
-            prompt: GeckoSession.PromptDelegate.AlertPrompt,
-        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> = queue { EnginePrompt.Alert(prompt, it) }
+        override fun onAlertPrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.AlertPrompt) =
+            queue { EnginePrompt.Alert(prompt, it) }
+        override fun onButtonPrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.ButtonPrompt) =
+            queue { EnginePrompt.Confirm(prompt, it) }
+        override fun onTextPrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.TextPrompt) =
+            queue { EnginePrompt.Text(prompt, it) }
+        override fun onAuthPrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.AuthPrompt) =
+            queue { EnginePrompt.Auth(prompt, it) }
+        override fun onChoicePrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.ChoicePrompt) =
+            queue { EnginePrompt.Choice(prompt, it) }
+        override fun onBeforeUnloadPrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.BeforeUnloadPrompt) =
+            queue { EnginePrompt.BeforeUnload(prompt, it) }
 
-        override fun onButtonPrompt(
-            session: GeckoSession,
-            prompt: GeckoSession.PromptDelegate.ButtonPrompt,
-        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> = queue { EnginePrompt.Confirm(prompt, it) }
-
-        override fun onTextPrompt(
-            session: GeckoSession,
-            prompt: GeckoSession.PromptDelegate.TextPrompt,
-        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> = queue { EnginePrompt.Text(prompt, it) }
-
-        override fun onAuthPrompt(
-            session: GeckoSession,
-            prompt: GeckoSession.PromptDelegate.AuthPrompt,
-        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> = queue { EnginePrompt.Auth(prompt, it) }
-
-        override fun onChoicePrompt(
-            session: GeckoSession,
-            prompt: GeckoSession.PromptDelegate.ChoicePrompt,
-        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> = queue { EnginePrompt.Choice(prompt, it) }
-
-        override fun onFilePrompt(
-            session: GeckoSession,
-            prompt: GeckoSession.PromptDelegate.FilePrompt,
-        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
-            notifyFeedback("此版本暂不支持文件上传")
+        override fun onFilePrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.FilePrompt): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
+            if (current(epoch)) notifyFeedback(R.string.engine_upload_unsupported)
             return GeckoResult.fromValue(prompt.dismiss())
         }
 
-        override fun onPopupPrompt(
-            session: GeckoSession,
-            prompt: GeckoSession.PromptDelegate.PopupPrompt,
-        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
-            notifyFeedback("已拦截站点弹窗")
+        override fun onPopupPrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.PopupPrompt): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
+            if (current(epoch)) notifyFeedback(R.string.engine_popup_blocked)
             return GeckoResult.fromValue(prompt.confirm(AllowOrDeny.DENY))
         }
 
-        override fun onDateTimePrompt(
-            session: GeckoSession,
-            prompt: GeckoSession.PromptDelegate.DateTimePrompt,
-        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
-            // P0 不做日期时间选择 UI：返回默认值，让引擎走系统行为
-            return GeckoResult.fromValue(prompt.dismiss())
-        }
-
-        override fun onColorPrompt(
-            session: GeckoSession,
-            prompt: GeckoSession.PromptDelegate.ColorPrompt,
-        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
-            return GeckoResult.fromValue(prompt.dismiss())
-        }
-
-        override fun onBeforeUnloadPrompt(
-            session: GeckoSession,
-            prompt: GeckoSession.PromptDelegate.BeforeUnloadPrompt,
-        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> = queue { EnginePrompt.BeforeUnload(prompt, it) }
+        override fun onDateTimePrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.DateTimePrompt): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> =
+            GeckoResult.fromValue(prompt.dismiss())
+        override fun onColorPrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.ColorPrompt): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> =
+            GeckoResult.fromValue(prompt.dismiss())
     }
 
     companion object {
         private const val TAG = "TabSession"
+        private const val WINDOW_REQUEST_TTL_MS = 3_000L
     }
 }
 
-/** UI 可应答的引擎提示集合；geckoResult 由控制器持有并完成。 */
+/** The origin is a parsed hostname, never a page-controlled title or credential-bearing URL. */
 sealed class EnginePrompt(
     val basePrompt: GeckoSession.PromptDelegate.BasePrompt,
     val geckoResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>,
 ) {
-    class Alert(
-        val prompt: GeckoSession.PromptDelegate.AlertPrompt,
-        geckoResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>,
-    ) : EnginePrompt(prompt, geckoResult)
+    var origin: String = ""
+        internal set
 
-    class Confirm(
-        val prompt: GeckoSession.PromptDelegate.ButtonPrompt,
-        geckoResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>,
-    ) : EnginePrompt(prompt, geckoResult)
-
-    class Text(
-        val prompt: GeckoSession.PromptDelegate.TextPrompt,
-        geckoResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>,
-    ) : EnginePrompt(prompt, geckoResult)
-
-    class Auth(
-        val prompt: GeckoSession.PromptDelegate.AuthPrompt,
-        geckoResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>,
-    ) : EnginePrompt(prompt, geckoResult)
-
-    class Choice(
-        val prompt: GeckoSession.PromptDelegate.ChoicePrompt,
-        geckoResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>,
-    ) : EnginePrompt(prompt, geckoResult)
-
-    class BeforeUnload(
-        val prompt: GeckoSession.PromptDelegate.BeforeUnloadPrompt,
-        geckoResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>,
-    ) : EnginePrompt(prompt, geckoResult)
+    class Alert(val prompt: GeckoSession.PromptDelegate.AlertPrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
+    class Confirm(val prompt: GeckoSession.PromptDelegate.ButtonPrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
+    class Text(val prompt: GeckoSession.PromptDelegate.TextPrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
+    class Auth(val prompt: GeckoSession.PromptDelegate.AuthPrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
+    class Choice(val prompt: GeckoSession.PromptDelegate.ChoicePrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
+    class BeforeUnload(val prompt: GeckoSession.PromptDelegate.BeforeUnloadPrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
 }

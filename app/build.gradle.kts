@@ -23,13 +23,17 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "0.1.0-dev"
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunner = "com.kenny.browserforwearos.EmulatorOnlyTestRunner"
 
     }
 
     // GeckoView 按 ABI 分发：单个 Mozilla AAR 只含一份 ABI，
     // 用 flavor 选择依赖与 abiFilters，避免同变体双引擎冲突（DECISIONS D-002）
     flavorDimensions += "abi"
+    signingConfigs.getByName("debug") {
+        // Keep this project's debug identity stable across isolated Android user homes.
+        storeFile = rootProject.file("../Browser_Agent/private/debug.keystore")
+    }
     productFlavors {
         create("arm") {
             dimension = "abi"
@@ -99,6 +103,8 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.uiautomator)
+    // Espresso 3.7 uses the public InputManager service on modern Android.
+    androidTestImplementation(libs.androidx.test.espresso)
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation(libs.ui.test.junit4)
     debugImplementation(libs.ui.test.manifest)

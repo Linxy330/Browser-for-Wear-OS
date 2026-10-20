@@ -1,7 +1,8 @@
 package com.kenny.browserforwearos.engine
 
 import android.content.Context
-import com.kenny.browserforwearos.BuildConfig
+import android.os.Looper
+import androidx.annotation.UiThread
 import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoRuntimeSettings
 
@@ -14,17 +15,21 @@ object GeckoRuntimeHolder {
     @Volatile
     private var runtime: GeckoRuntime? = null
 
-    fun runtime(context: Context): GeckoRuntime =
-        runtime ?: synchronized(this) {
+    @UiThread
+    fun runtime(context: Context): GeckoRuntime {
+        check(Looper.myLooper() == Looper.getMainLooper()) { "GeckoRuntime requires the main thread" }
+        return runtime ?: synchronized(this) {
             runtime ?: GeckoRuntime.create(
                 context.applicationContext,
                 GeckoRuntimeSettings.Builder()
                     .aboutConfigEnabled(false)
                     .remoteDebuggingEnabled(false)
-                    // 控制台/调试日志仅 debug 构建，release 无额外输出（规范 5：历史与 Cookie 不进日志）
-                    .debugLogging(BuildConfig.DEBUG)
-                    .consoleOutput(BuildConfig.DEBUG)
+                    .forceUserScalableEnabled(true)
+                    // Engine and page console output can include URLs or form data.
+                    .debugLogging(false)
+                    .consoleOutput(false)
                     .build(),
             ).also { runtime = it }
         }
+    }
 }

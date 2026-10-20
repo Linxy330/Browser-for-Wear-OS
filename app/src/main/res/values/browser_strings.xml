@@ -1,0 +1,36 @@
+<resources>
+    <string name="restoring">Restoring tabs…</string>
+    <string name="continue_browsing">Continue browsing</string>
+    <string name="bookmarks">Bookmarks</string>
+    <string name="history">History</string>
+    <string name="settings">Settings</string>
+    <string name="edit_address">Address / search</string>
+    <string name="tools">Menu</string>
+    <string name="back_to_page">Back to page</string>
+    <string name="secure_connection">Connection verified by engine</string>
+    <string name="unconfirmed_connection">Connection security unconfirmed</string>
+    <string name="go_back">Back</string>
+    <string name="go_forward">Forward</string>
+    <string name="stop">Stop loading</string>
+    <string name="reload">Reload</string>
+    <string name="new_tab">New tab</string>
+    <string name="tabs">Tabs</string>
+    <string name="tabs_count">Tabs (%1$d / 3)</string>
+    <string name="empty_tab">New tab</string>
+    <string name="close_tab">Close tab</string>
+    <string name="add_bookmark">Bookmark this page</string>
+    <string name="zoom_in">Zoom in</string>
+    <string name="zoom_out">Zoom out</string>
+    <string name="fit_screen">Fit screen</string>
+    <string name="immersive">Immersive view</string>
+    <string name="no_bookmarks">No bookmarks yet</string>
+    <string name="no_history">No browsing history</string>
+    <string name="edit_title">Edit title</string>
+    <string name="delete">Delete</string>
+    <string name="clear_history">Clear history</string>
+    <string name="search_engine">Search engine</string>
+    <string name="clear_site_data">Clear website data</string>
+    <string name="clear_site_warning">This clears cookies, cache and website storage for every tab. You will be signed out of websites. Bookmarks and history are kept.</string>
+    <string name="clear_confirm">Clear website data now</string>
+    <string name="voice_input">Voice input</string>
+</resources>

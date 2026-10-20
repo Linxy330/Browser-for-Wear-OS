@@ -1,0 +1,14 @@
+<resources>
+    <string name="data_save_failed">无法保存浏览资料，请检查设备存储空间</string>
+    <string name="data_corrupt_recovered">浏览资料已损坏，已隔离原文件并恢复空白资料</string>
+    <string name="data_read_failed">无法读取浏览资料，已打开空白标签</string>
+    <string name="data_invalid_address">请输入有效的网址或搜索词；仅支持 HTTP 和 HTTPS 网址</string>
+    <string name="data_tab_limit">最多打开 3 个标签，请先关闭一个标签</string>
+    <string name="data_popup_tab_limit">最多打开 3 个标签，已取消新窗口；请先关闭一个标签</string>
+    <string name="data_bookmark_unavailable">请先打开一个可收藏的网页</string>
+    <string name="data_bookmark_exists">此网页已收藏</string>
+    <string name="data_bookmark_added">已添加书签</string>
+    <string name="data_history_cleared">已清除浏览历史</string>
+    <string name="data_site_data_cleared">已清除网站数据，重新打开网站需要再次登录</string>
+    <string name="data_site_data_failed">清除网站数据失败，请重试</string>
+</resources>

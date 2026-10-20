@@ -21,9 +21,11 @@ class EngineStartupTest {
     @Test
     fun runtimeIsProcessSingleton() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val first: GeckoRuntime = GeckoRuntimeHolder.runtime(context)
-        val second: GeckoRuntime = GeckoRuntimeHolder.runtime(context)
-        assertSame(first, second)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val first: GeckoRuntime = GeckoRuntimeHolder.runtime(context)
+            val second: GeckoRuntime = GeckoRuntimeHolder.runtime(context)
+            assertSame(first, second)
+        }
     }
 
     @Test

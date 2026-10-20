@@ -1,284 +1,324 @@
 package com.kenny.browserforwearos.presentation
 
+import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
+import android.speech.RecognizerIntent
+import android.view.InputDevice
+import android.view.MotionEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.rotary.onRotaryScrollEvent
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
-import androidx.wear.compose.material3.AlertDialog
-import androidx.wear.compose.material3.AppScaffold
-import androidx.wear.compose.material3.Button
-import androidx.wear.compose.material3.MaterialTheme
-import androidx.wear.compose.material3.OutlinedButton
-import androidx.wear.compose.material3.Text
-import com.kenny.browserforwearos.BuildConfig
+import androidx.wear.compose.material3.*
 import com.kenny.browserforwearos.R
+import com.kenny.browserforwearos.data.SearchEngine
 import com.kenny.browserforwearos.engine.EnginePrompt
 import com.kenny.browserforwearos.engine.TabSessionController
 import com.kenny.browserforwearos.presentation.theme.BrowserForWearOSTheme
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.mozilla.geckoview.GeckoView
+import java.net.URI
+import kotlin.math.min
 
-/**
- * B1 真机引擎门禁界面：最小可用的 地址输入 → 真实网页 渲染路径。
- * 圆屏完整 UI（首页/工具菜单/四角按钮等）在 B2 展开；此处地址判别为临时规则。
- */
 class MainActivity : ComponentActivity() {
-
     private val viewModel: BrowserViewModel by viewModels()
-
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
-        setContent {
-            BrowserForWearOSTheme {
-                BrowserNavHost(viewModel)
-            }
-        }
+        setContent { BrowserForWearOSTheme { BrowserNavHost(viewModel) } }
     }
-
-    override fun onPause() {
-        super.onPause()
-        // 熄屏/后台暂停非必要网页活动；setActive(false) 的真实行为由 B1 真机验证记录
-        viewModel.controller.setActive(false)
-    }
-
-    override fun onResume() {
-        super.onResume()
-        viewModel.controller.setActive(true)
-    }
+    override fun onPause() { viewModel.setForeground(false); super.onPause() }
+    override fun onResume() { super.onResume(); viewModel.setForeground(true) }
 }
 
-private enum class Screen { Home, Address, Web }
+private enum class Screen { Home, Address, Web, Menu, Tabs, Bookmarks, History, Settings, ClearData, EditBookmark }
 
 @Composable
 fun BrowserNavHost(viewModel: BrowserViewModel) {
-    var screen by remember { mutableStateOf(Screen.Home) }
-    val controller = viewModel.controller
-
-    when (screen) {
-        Screen.Home -> HomeScreen(
-            onOpenWeb = { screen = Screen.Address },
-        )
-        Screen.Address -> AddressScreen(
-            onSubmit = { input ->
-                viewModel.submitAddress(input)
-                screen = Screen.Web
-            },
-            onCancel = { screen = Screen.Home },
-        )
-        Screen.Web -> WebScreen(
-            viewModel = viewModel,
-            onHome = { screen = Screen.Home },
-        )
-    }
-
-    // 引擎反馈（弹窗拦截/未支持链接等）：轻量浮层，4 秒自动消失
-    val feedback by controller.feedback.collectAsState()
-    feedback?.let { message ->
-        LaunchedEffect(message) {
-            delay(4000)
-            controller.consumeFeedback()
-        }
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(top = 20.dp),
-            contentAlignment = Alignment.TopCenter,
-        ) {
-            Text(
-                text = message,
-                style = MaterialTheme.typography.bodyMedium,
-                textAlign = TextAlign.Center,
-                modifier = Modifier
-                    .background(MaterialTheme.colorScheme.surfaceContainer, MaterialTheme.shapes.small)
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-            )
+    val ready by viewModel.ready.collectAsState()
+    val tabs by viewModel.tabs.collectAsState()
+    val selected by viewModel.selectedTabId.collectAsState()
+    val bookmarks by viewModel.bookmarks.collectAsState()
+    val history by viewModel.history.collectAsState()
+    val search by viewModel.searchEngine.collectAsState()
+    var screen by rememberSaveable { mutableStateOf(Screen.Home) }
+    var returnTo by rememberSaveable { mutableStateOf(Screen.Home) }
+    var editingBookmark by rememberSaveable { mutableStateOf<String?>(null) }
+    var immersive by rememberSaveable { mutableStateOf(false) }
+    var viewport by remember { mutableStateOf<GeckoView?>(null) }
+    val controller = tabs.firstOrNull { it.id == selected }?.controller
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(screen, selected, ready) { viewModel.setWebVisible(screen == Screen.Web) }
+    BackHandler(enabled = screen != Screen.Home) {
+        when (screen) {
+            Screen.Web -> {
+                if (controller?.fullScreen?.value == true) controller.exitFullScreen()
+                else if (controller?.canGoBack?.value == true) controller.goBack()
+                else screen = Screen.Home
+            }
+            Screen.Address -> { keyboard?.hide(); screen = returnTo }
+            Screen.Menu -> screen = Screen.Web
+            Screen.EditBookmark -> screen = Screen.Bookmarks
+            Screen.ClearData -> screen = Screen.Settings
+            else -> screen = Screen.Home
         }
     }
-
-    EnginePromptDialogs(controller)
-}
-
-@Composable
-fun HomeScreen(onOpenWeb: () -> Unit) {
-    AppScaffold {
-        Box(
-            modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text(
-                    text = stringResource(R.string.app_name),
-                    textAlign = TextAlign.Center,
-                    style = MaterialTheme.typography.titleLarge,
-                )
-                Text(
-                    text = BuildConfig.VERSION_NAME,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Text(
-                    text = stringResource(R.string.abi_label, BuildConfig.FLAVOR),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Button(
-                    onClick = onOpenWeb,
-                    modifier = Modifier.padding(top = 8.dp),
-                ) {
-                    Text(stringResource(R.string.b1_open_web))
-                }
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        if (!ready || controller == null) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(stringResource(R.string.restoring)) }
+            return@Box
+        }
+        if (screen == Screen.Web || screen == Screen.Menu) {
+            key(controller.tabId) {
+                WebScreen(controller, immersive, screen == Screen.Web, { screen = Screen.Menu }, {
+                    returnTo = Screen.Web; screen = Screen.Address
+                }, { viewport = it })
             }
         }
-    }
-}
-
-@Composable
-fun AddressScreen(
-    onSubmit: (String) -> Unit,
-    onCancel: () -> Unit,
-) {
-    var text by remember { mutableStateOf("") }
-    AppScaffold {
-        Column(
-            modifier = Modifier.fillMaxSize().padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text(
-                text = stringResource(R.string.b1_address_title),
-                style = MaterialTheme.typography.titleLarge,
-            )
-            BasicTextField(
-                value = text,
-                onValueChange = { text = it },
-                textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(MaterialTheme.colorScheme.surfaceContainer, MaterialTheme.shapes.small)
-                    .padding(12.dp),
-                decorationBox = { inner ->
-                    Box {
-                        if (text.isEmpty()) {
-                            Text(
-                                text = stringResource(R.string.b1_address_hint),
-                                style = TextStyle(color = MaterialTheme.colorScheme.onSurfaceVariant),
-                            )
+        val currentUrl by controller.url.collectAsState()
+        when (screen) {
+            Screen.Home -> RoundList {
+                item { PageTitle(stringResource(R.string.app_name)) }
+                item { Action(R.string.b1_open_web) { returnTo = Screen.Home; screen = Screen.Address } }
+                if (currentUrl.isNotEmpty()) item { Action(R.string.continue_browsing) { screen = Screen.Web } }
+                item { Action(R.string.tabs) { screen = Screen.Tabs } }
+                item { Action(R.string.bookmarks) { screen = Screen.Bookmarks } }
+                item { Action(R.string.history) { screen = Screen.History } }
+                item { Action(R.string.settings) { screen = Screen.Settings } }
+            }
+            Screen.Address -> AddressScreen(currentUrl,
+                onSubmit = { if (viewModel.submitAddress(it)) { keyboard?.hide(); screen = Screen.Web } },
+                onCancel = { keyboard?.hide(); screen = returnTo })
+            Screen.Menu -> {
+                val back by controller.canGoBack.collectAsState()
+                val forward by controller.canGoForward.collectAsState()
+                val loading by controller.isLoading.collectAsState()
+                val url by controller.url.collectAsState()
+                val secure by controller.isSecure.collectAsState()
+                RoundList {
+                    item { PageTitle(stringResource(R.string.tools)) }
+                    item { Text(url, modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodySmall) }
+                    item { Text(stringResource(if (secure) R.string.secure_connection else R.string.unconfirmed_connection), style = MaterialTheme.typography.bodySmall) }
+                    item { Action(R.string.back_to_page) { screen = Screen.Web } }
+                    item { Action(R.string.edit_address) { returnTo = Screen.Web; screen = Screen.Address } }
+                    item { Action(R.string.go_back, back) { controller.goBack(); screen = Screen.Web } }
+                    item { Action(R.string.go_forward, forward) { controller.goForward(); screen = Screen.Web } }
+                    item { Action(if (loading) R.string.stop else R.string.reload) { if (loading) controller.stop() else controller.reload(); screen = Screen.Web } }
+                    item { Action(R.string.tabs) { screen = Screen.Tabs } }
+                    item { Action(R.string.add_bookmark, url.startsWith("http")) { viewModel.addBookmark() } }
+                    item { Action(R.string.zoom_in) { viewport?.let { SingleHandZoom.zoom(it, 1.35f) }; screen = Screen.Web } }
+                    item { Action(R.string.zoom_out) { viewport?.let { SingleHandZoom.zoom(it, 1 / 1.35f) }; screen = Screen.Web } }
+                    item { Action(R.string.fit_screen) { immersive = false; viewport?.let { SingleHandZoom.reset(it) }; screen = Screen.Web } }
+                    item { Action(R.string.immersive) { immersive = true; screen = Screen.Web } }
+                    item { Action(R.string.b1_home) { screen = Screen.Home } }
+                    item { Action(R.string.settings) { screen = Screen.Settings } }
+                }
+            }
+            Screen.Tabs -> RoundList {
+                item { PageTitle(stringResource(R.string.tabs_count, tabs.size)) }
+                item { Action(R.string.new_tab) { if (viewModel.newTab()) { returnTo = Screen.Tabs; screen = Screen.Address } } }
+                tabs.forEach { tab ->
+                    item(key = tab.id) {
+                        val title by tab.controller.title.collectAsState()
+                        val url by tab.controller.url.collectAsState()
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            val label = title.ifEmpty { url }.ifEmpty { stringResource(R.string.empty_tab) }
+                            Button(onClick = { viewModel.selectTab(tab.id); screen = if (url.isEmpty()) Screen.Home else Screen.Web }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                                Text((if (tab.id == selected) "• " else "") + label, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                            }
+                            Action(R.string.close_tab) { viewModel.closeTab(tab.id) }
                         }
-                        inner()
                     }
-                },
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = { onSubmit(text) },
-                    enabled = text.isNotBlank(),
-                ) {
-                    Text(stringResource(R.string.b1_go))
                 }
-                OutlinedButton(onClick = onCancel) {
-                    Text(stringResource(R.string.b1_cancel))
-                }
+                item { Action(R.string.b1_home) { screen = Screen.Home } }
+            }
+            Screen.Bookmarks -> RoundList {
+                item { PageTitle(stringResource(R.string.bookmarks)) }
+                if (bookmarks.isEmpty()) item { Text(stringResource(R.string.no_bookmarks)) }
+                bookmarks.forEach { entry -> item(key = entry.id) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Button(onClick = { if (viewModel.submitAddress(entry.url)) screen = Screen.Web }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(entry.title.ifEmpty { entry.url }, maxLines = 3, overflow = TextOverflow.Ellipsis) }
+                        Action(R.string.edit_title) { editingBookmark = entry.id; screen = Screen.EditBookmark }
+                        Action(R.string.delete) { viewModel.removeBookmark(entry.id) }
+                    }
+                } }
+                item { Action(R.string.b1_home) { screen = Screen.Home } }
+            }
+            Screen.EditBookmark -> {
+                val bookmark = bookmarks.firstOrNull { it.id == editingBookmark }
+                EditorScreen(bookmark?.title.orEmpty(), stringResource(R.string.edit_title), false,
+                    onSubmit = { title -> bookmark?.let { viewModel.editBookmark(it.id, title) }; screen = Screen.Bookmarks },
+                    onCancel = { screen = Screen.Bookmarks })
+            }
+            Screen.History -> RoundList {
+                item { PageTitle(stringResource(R.string.history)) }
+                if (history.isEmpty()) item { Text(stringResource(R.string.no_history)) }
+                history.forEach { entry -> item(key = entry.id) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Button(onClick = { if (viewModel.submitAddress(entry.url)) screen = Screen.Web }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(entry.title.ifEmpty { entry.url }, maxLines = 3, overflow = TextOverflow.Ellipsis) }
+                        Text(entry.url, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Action(R.string.delete) { viewModel.removeHistory(entry.id) }
+                    }
+                } }
+                if (history.isNotEmpty()) item { Action(R.string.clear_history) { viewModel.clearHistory() } }
+                item { Action(R.string.b1_home) { screen = Screen.Home } }
+            }
+            Screen.Settings -> RoundList {
+                item { PageTitle(stringResource(R.string.settings)) }
+                item { Text(stringResource(R.string.search_engine)) }
+                SearchEngine.entries.forEach { engine -> item {
+                    Button(onClick = { viewModel.setSearchEngine(engine) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text((if (engine == search) "• " else "") + when(engine) { SearchEngine.BING -> "Bing"; SearchEngine.GOOGLE -> "Google"; SearchEngine.DUCKDUCKGO -> "DuckDuckGo" }) }
+                } }
+                item { Action(R.string.clear_site_data) { screen = Screen.ClearData } }
+                item { Action(R.string.b1_home) { screen = Screen.Home } }
+            }
+            Screen.ClearData -> RoundList {
+                item { PageTitle(stringResource(R.string.clear_site_data)) }
+                item { Text(stringResource(R.string.clear_site_warning)) }
+                item { Action(R.string.clear_confirm) { viewModel.clearSiteData(); screen = Screen.Settings } }
+                item { Action(R.string.b1_cancel) { screen = Screen.Settings } }
+            }
+            Screen.Web -> Unit
+        }
+        val appFeedback by viewModel.feedback.collectAsState()
+        val engineFeedback by controller.feedback.collectAsState()
+        (appFeedback ?: engineFeedback)?.let { message ->
+            LaunchedEffect(message) { delay(3500); viewModel.consumeFeedback(); controller.consumeFeedback() }
+            Box(Modifier.fillMaxSize().padding(horizontal = 28.dp), contentAlignment = Alignment.Center) {
+                Text(message, textAlign = TextAlign.Center, modifier = Modifier.background(MaterialTheme.colorScheme.surfaceContainer, MaterialTheme.shapes.small).padding(12.dp))
             }
         }
+        EnginePromptDialogs(controller)
+    }
+}
+
+/** End padding lets every item move into the readable centre of a round display. */
+@Composable
+private fun RoundList(content: LazyListScope.() -> Unit) {
+    val state = rememberLazyListState()
+    val focus = remember { FocusRequester() }
+    val scope = rememberCoroutineScope()
+    BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        LazyColumn(state = state,
+            modifier = Modifier.fillMaxSize().onRotaryScrollEvent { event -> scope.launch { state.scrollBy(event.verticalScrollPixels) }; true }.focusRequester(focus).focusable(),
+            contentPadding = PaddingValues(horizontal = maxWidth * .13f, vertical = maxHeight * .25f),
+            verticalArrangement = Arrangement.spacedBy(8.dp), horizontalAlignment = Alignment.CenterHorizontally, content = content)
+    }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+}
+
+@Composable
+private fun PageTitle(text: String) = Text(text, textAlign = TextAlign.Center, style = MaterialTheme.typography.titleMedium)
+
+@Composable
+private fun Action(label: Int, enabled: Boolean = true, onClick: () -> Unit) {
+    Button(onClick = onClick, enabled = enabled, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(stringResource(label), textAlign = TextAlign.Center) }
+}
+
+@Composable
+fun AddressScreen(initial: String = "", onSubmit: (String) -> Unit, onCancel: () -> Unit) =
+    EditorScreen(initial, stringResource(R.string.b1_address_title), true, onSubmit, onCancel)
+
+@Composable
+private fun EditorScreen(initial: String, title: String, voice: Boolean, onSubmit: (String) -> Unit, onCancel: () -> Unit) {
+    var text by rememberSaveable(initial) { mutableStateOf(initial) }
+    val context = LocalContext.current
+    val speech = remember { Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM) }
+    val canSpeak = remember { speech.resolveActivity(context.packageManager) != null }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK) result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { text = it }
+    }
+    RoundList {
+        item { PageTitle(title) }
+        item { BasicTextField(value = text, onValueChange = { text = it }, textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go), keyboardActions = KeyboardActions(onGo = { if (text.isNotBlank()) onSubmit(text) }),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).background(MaterialTheme.colorScheme.surfaceContainer, MaterialTheme.shapes.small).padding(12.dp),
+            decorationBox = { inner -> Box { if (text.isEmpty()) Text(stringResource(R.string.b1_address_hint), color = MaterialTheme.colorScheme.onSurfaceVariant); inner() } }) }
+        item { Action(R.string.b1_go, text.isNotBlank()) { onSubmit(text) } }
+        if (voice && canSpeak) item { Action(R.string.voice_input) { launcher.launch(speech) } }
+        item { Action(R.string.b1_cancel, onClick = onCancel) }
     }
 }
 
 @Composable
-fun WebScreen(
-    viewModel: BrowserViewModel,
-    onHome: () -> Unit,
-) {
-    val controller = viewModel.controller
+private fun WebScreen(controller: TabSessionController, immersive: Boolean, active: Boolean, onMenu: () -> Unit, onAddress: () -> Unit, onView: (GeckoView) -> Unit) {
     val url by controller.url.collectAsState()
     val title by controller.title.collectAsState()
     val loading by controller.isLoading.collectAsState()
     val progress by controller.progress.collectAsState()
-    val canGoBack by controller.canGoBack.collectAsState()
-
-    // B1 返回顺序简化：网页历史后退 → 回首页；键盘/弹层/全屏层级在 B2 补全
-    BackHandler(enabled = true) {
-        if (canGoBack) {
-            controller.goBack()
-        } else {
-            onHome()
-        }
+    val error by controller.error.collectAsState()
+    val suspended by controller.suspendedState.collectAsState()
+    var nativeView by remember { mutableStateOf<GeckoView?>(null) }
+    LaunchedEffect(active, suspended, nativeView) {
+        if (active && !suspended) nativeView?.requestFocus()
     }
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        // B1 临时状态条：真实引擎状态（最终网址/标题/加载进度）
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color.Black)
-                .padding(horizontal = 8.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = title.ifEmpty { url },
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (loading) {
-                    Text(
-                        text = stringResource(R.string.b1_loading, progress),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color(0xFF9BE29B),
-                    )
-                }
+    BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
+        val side = min(maxWidth.value, maxHeight.value).dp * .68f
+        val webModifier = if (immersive) Modifier.fillMaxSize() else Modifier.size(side)
+        AndroidView(factory = { context -> GeckoView(context).apply {
+            setViewBackend(GeckoView.BACKEND_TEXTURE_VIEW)
+            if (!suspended && controller.session.isOpen) setSession(controller.session)
+            controller.onBeforeSuspend = { SingleHandZoom.cancel(this); if (session === controller.session) releaseSession() }
+            setOnGenericMotionListener { _, event ->
+                if (event.action == MotionEvent.ACTION_SCROLL && event.isFromSource(InputDevice.SOURCE_ROTARY_ENCODER)) {
+                    controller.scrollBy(-event.getAxisValue(MotionEvent.AXIS_SCROLL) * 48 * resources.displayMetrics.density); true
+                } else false
             }
-            Button(onClick = onHome) {
-                Text(stringResource(R.string.b1_home))
+            nativeView = this
+            onView(this)
+        } }, update = { view ->
+            if (!suspended && controller.session.isOpen && view.session !== controller.session) { view.releaseSession(); view.setSession(controller.session) }
+            controller.onBeforeSuspend = { SingleHandZoom.cancel(view); if (view.session === controller.session) view.releaseSession() }
+            onView(view)
+        },
+            onRelease = { view -> SingleHandZoom.cancel(view); if (view.session === controller.session) { view.releaseSession(); controller.onBeforeSuspend = null } }, modifier = webModifier.align(Alignment.Center))
+        Text(text = if (loading) stringResource(R.string.b1_loading, progress) else title.ifEmpty { runCatching { URI(url).host }.getOrNull() ?: url },
+            color = Color.White, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center,
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = 14.dp).fillMaxWidth(.50f).background(Color.Black).clickable(onClick = onAddress))
+        error?.let { message ->
+            Box(Modifier.size(side).align(Alignment.Center).background(MaterialTheme.colorScheme.background), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(message, textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall)
+                    Action(R.string.reload) { controller.reload() }
+                }
             }
         }
-        // 网页主体：GeckoView。factory 每次挂载只执行一次，setSession 不触发重新加载；
-        // 离开组合时 releaseSession 解绑视图但保留会话（规范 3.2 规则 2）
-        AndroidView(
-            factory = { context ->
-                GeckoView(context).apply {
-                    setSession(controller.session)
-                }
-            },
-            onRelease = { view ->
-                if (view.session === controller.session) {
-                    view.releaseSession()
-                }
-            },
-            modifier = Modifier.fillMaxSize(),
-        )
+        Button(onClick = onMenu, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 5.dp).heightIn(min = 48.dp)) { Text(stringResource(R.string.tools)) }
     }
 }
 
@@ -299,8 +339,8 @@ fun EnginePromptDialogs(controller: TabSessionController) {
                         Text(stringResource(R.string.b1_ok))
                     }
                 },
-                title = { Text(current.prompt.title.orEmpty()) },
-                text = { Text(current.prompt.message.orEmpty()) },
+                title = { Text(current.prompt.title.orEmpty().ifEmpty { current.origin }) },
+                text = { Text(current.origin + "\n" + current.prompt.message.orEmpty()) },
             )
         }
         is EnginePrompt.Confirm -> {
@@ -312,8 +352,8 @@ fun EnginePromptDialogs(controller: TabSessionController) {
                         Text(stringResource(R.string.b1_ok))
                     }
                 },
-                title = { Text(current.prompt.title.orEmpty()) },
-                text = { Text(current.prompt.message.orEmpty()) },
+                title = { Text(current.prompt.title.orEmpty().ifEmpty { current.origin }) },
+                text = { Text(current.origin + "\n" + current.prompt.message.orEmpty()) },
                 dismissButton = {
                     OutlinedButton(onClick = { controller.confirmButton(false) }) {
                         Text(stringResource(R.string.b1_cancel))
@@ -331,8 +371,8 @@ fun EnginePromptDialogs(controller: TabSessionController) {
                         Text(stringResource(R.string.b1_ok))
                     }
                 },
-                title = { Text(current.prompt.title.orEmpty()) },
-                text = { Text(current.prompt.message.orEmpty()) },
+                title = { Text(current.prompt.title.orEmpty().ifEmpty { current.origin }) },
+                text = { Text(current.origin + "\n" + current.prompt.message.orEmpty()) },
                 dismissButton = {
                     OutlinedButton(onClick = { controller.dismissPrompt() }) {
                         Text(stringResource(R.string.b1_cancel))
@@ -364,8 +404,8 @@ fun EnginePromptDialogs(controller: TabSessionController) {
                         Text(stringResource(R.string.b1_ok))
                     }
                 },
-                title = { Text(current.prompt.title.orEmpty()) },
-                text = { Text(current.prompt.message.orEmpty()) },
+                title = { Text(current.prompt.title.orEmpty().ifEmpty { current.origin }) },
+                text = { Text(current.origin + "\n" + current.prompt.message.orEmpty()) },
                 dismissButton = {
                     OutlinedButton(onClick = { controller.dismissPrompt() }) {
                         Text(stringResource(R.string.b1_cancel))
@@ -397,6 +437,8 @@ fun EnginePromptDialogs(controller: TabSessionController) {
                             BasicTextField(
                                 value = pass,
                                 onValueChange = { pass = it },
+                                visualTransformation = PasswordVisualTransformation(),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                                 textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -420,33 +462,79 @@ fun EnginePromptDialogs(controller: TabSessionController) {
             )
         }
         is EnginePrompt.Choice -> {
+            data class ChoiceRow(
+                val key: String,
+                val choice: org.mozilla.geckoview.GeckoSession.PromptDelegate.ChoicePrompt.Choice,
+                val depth: Int,
+                val disabled: Boolean,
+                val group: Boolean,
+            )
+            val rows = remember(current) {
+                buildList<ChoiceRow> {
+                    fun append(
+                        choices: Array<org.mozilla.geckoview.GeckoSession.PromptDelegate.ChoicePrompt.Choice>,
+                        depth: Int,
+                        ancestorDisabled: Boolean,
+                        path: String,
+                    ) {
+                        choices.forEachIndexed { index, choice ->
+                            val key = "$path/$index"
+                            val children = choice.items
+                            val disabled = ancestorDisabled || choice.disabled
+                            add(ChoiceRow(key, choice, depth, disabled, children != null))
+                            if (children != null) append(children, depth + 1, disabled, key)
+                        }
+                    }
+                    append(current.prompt.choices, 0, false, "choice")
+                }
+            }
+            val multiple = current.prompt.type == org.mozilla.geckoview.GeckoSession.PromptDelegate.ChoicePrompt.Type.MULTIPLE
+            var selectedIds by remember(current) {
+                mutableStateOf(rows.filter { !it.group && !it.choice.separator && it.choice.selected }.map { it.choice.id }.toSet())
+            }
             AlertDialog(
                 visible = true,
                 onDismissRequest = { controller.dismissPrompt() },
                 confirmButton = {
-                    OutlinedButton(onClick = { controller.dismissPrompt() }) {
-                        Text(stringResource(R.string.b1_cancel))
+                    if (multiple) {
+                        Button(onClick = {
+                            controller.confirmChoices(rows.filter { !it.group && !it.choice.separator && it.choice.id in selectedIds }.map { it.choice }.toTypedArray())
+                        }) { Text(stringResource(R.string.b1_ok)) }
+                    } else {
+                        OutlinedButton(onClick = { controller.dismissPrompt() }) { Text(stringResource(R.string.b1_cancel)) }
                     }
                 },
-                title = { Text(current.prompt.title.orEmpty()) },
-                text = { Text(current.prompt.message.orEmpty()) },
+                dismissButton = {
+                    if (multiple) OutlinedButton(onClick = { controller.dismissPrompt() }) { Text(stringResource(R.string.b1_cancel)) }
+                },
+                title = { Text(current.prompt.title.orEmpty().ifEmpty { current.origin }) },
+                text = { Text(current.origin + "\n" + current.prompt.message.orEmpty()) },
                 content = {
-                    current.prompt.choices.forEach { choice ->
-                        item(key = choice.id) {
-                            Text(
-                                text = choice.label,
-                                style = MaterialTheme.typography.bodyMedium,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .then(
-                                        if (choice.disabled) {
-                                            Modifier
-                                        } else {
-                                            Modifier.clickable { controller.confirmChoice(choice) }
-                                        },
+                    rows.forEach { row ->
+                        item(key = row.key) {
+                            val choice = row.choice
+                            when {
+                                choice.separator -> Box(Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.colorScheme.onSurfaceVariant))
+                                row.group -> Text(
+                                    text = choice.label,
+                                    color = if (row.disabled) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.fillMaxWidth().padding(start = (row.depth * 8).dp, top = 8.dp),
+                                )
+                                else -> OutlinedButton(
+                                    enabled = !row.disabled,
+                                    onClick = {
+                                        if (multiple) selectedIds = if (choice.id in selectedIds) selectedIds - choice.id else selectedIds + choice.id
+                                        else controller.confirmChoice(choice)
+                                    },
+                                    modifier = Modifier.fillMaxWidth().padding(start = (row.depth * 8).dp).heightIn(min = 48.dp),
+                                ) {
+                                    Text(
+                                        text = (if (choice.id in selectedIds) "✓ " else if (multiple) "○ " else "") + choice.label,
+                                        textAlign = TextAlign.Center,
                                     )
-                                    .padding(vertical = 8.dp),
-                            )
+                                }
+                            }
                         }
                     }
                 },
