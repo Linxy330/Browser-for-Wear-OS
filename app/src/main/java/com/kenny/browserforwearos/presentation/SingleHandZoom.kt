@@ -39,6 +39,12 @@ internal object SingleHandZoom {
         state.sendCancel = null
     }
 
+    /** A different native page must not inherit the prior page's button zoom estimate. */
+    fun forget(view: GeckoView) {
+        cancel(view)
+        states.remove(view)
+    }
+
     private fun schedule(view: GeckoView, state: State, factor: Float) {
         state.busy = true
         val begin = Runnable {

@@ -40,6 +40,7 @@ import org.junit.runners.model.Statement
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoView
 import java.io.File
+import java.net.URI
 import java.util.UUID
 import kotlin.math.max
 import kotlin.math.min
@@ -47,7 +48,8 @@ import kotlin.math.min
 /**
  * Exclusive instrumentation run: do not run alongside other tests or manual app control.
  * Requires emulator-scoped port 8787 reverse to the controlled HTTP server.
- * Default archive run is 1800 seconds. SOAK_SECONDS is only for shorter development runs.
+ * Default archive run is 1800 seconds. SOAK_SECONDS / SOAK_CYCLES / SOAK_BACKGROUNDS
+ * can compress the same transitions for development; archive assertions remain unchanged.
  * Covers Activity pause/stop/resume, not display power, Doze, physical heat, or Ambient.
  */
 @RunWith(AndroidJUnit4::class)
@@ -70,6 +72,13 @@ class EmulatorSoakTest {
     private var phase = "setup"
     private var status = "RUNNING"
     private var failureClass: String? = null
+    private var expectedUrl = ""
+    private var expectedTitle = ""
+    private var expectedAfterRevision = -1L
+    private var expectedTabId: String? = null
+    private var pageDiagnostic: JSONObject? = null
+    private var plannedCycleCount = 0
+    private var plannedBackgroundCount = 0
 
     private val emulatorOnly = object : TestRule {
         override fun apply(base: Statement, description: Description): Statement = object : Statement() {
@@ -110,8 +119,14 @@ class EmulatorSoakTest {
         requestedSeconds = (arguments.getString("SOAK_SECONDS") ?: arguments.getString("soak_seconds"))
             ?.toLongOrNull()?.coerceIn(30L, 10_800L) ?: 1800L
         val fullRun = requestedSeconds >= 1800L
-        val plannedCycles = if (fullRun) 36 else min(36, max(3, (requestedSeconds / 20).toInt()))
-        val plannedBackgrounds = if (fullRun) 10 else min(2, plannedCycles)
+        val plannedCycles = (arguments.getString("SOAK_CYCLES") ?: arguments.getString("soak_cycles"))
+            ?.toIntOrNull()?.coerceIn(1, 360)
+            ?: if (fullRun) 36 else min(36, max(3, (requestedSeconds / 20).toInt()))
+        val plannedBackgrounds = (arguments.getString("SOAK_BACKGROUNDS") ?: arguments.getString("soak_backgrounds"))
+            ?.toIntOrNull()?.coerceIn(0, plannedCycles)
+            ?: if (fullRun) 10 else min(2, plannedCycles)
+        plannedCycleCount = plannedCycles
+        plannedBackgroundCount = plannedBackgrounds
         val pages = listOf(
             "$baseUrl/counter" to "计数器",
             "$baseUrl/long" to "长页面",
@@ -198,6 +213,8 @@ class EmulatorSoakTest {
         } catch (error: Throwable) {
             status = "FAIL"
             failureClass = error.javaClass.simpleName
+            if (pageDiagnostic == null) pageDiagnostic = capturePageDiagnostic()
+            Log.i("EmulatorSoak", "Failure state: $pageDiagnostic")
             throw error
         } finally {
             // Restore the activity state before the Compose rule tears its host down.
@@ -207,6 +224,11 @@ class EmulatorSoakTest {
     }
 
     private fun awaitPage(url: String, title: String, afterRevision: Long = -1L) {
+        expectedUrl = url
+        expectedTitle = title
+        expectedAfterRevision = afterRevision
+        expectedTabId = model.selectedTabId.value
+        pageDiagnostic = null
         compose.waitForIdle()
         await("Controlled page must commit without an engine failure") {
             model.controller.error.value == null && model.controller.committedUrl.value == url &&
@@ -219,6 +241,36 @@ class EmulatorSoakTest {
         }
         renderChecks++
     }
+
+    /** Test URLs are summarized as paths; credentials, host, query and fragments stay out. */
+    private fun diagnosticPath(url: String): String =
+        runCatching { URI(url).rawPath.orEmpty() }.getOrDefault("unparseable")
+
+    private fun capturePageDiagnostic(): JSONObject = runCatching {
+        onUi {
+            val controller = model.controller
+            JSONObject()
+                .put("phase", phase)
+                .put("completedCycles", cycles)
+                .put("expectedPath", diagnosticPath(expectedUrl))
+                .put("expectedTitle", expectedTitle)
+                .put("expectedAfterRevision", expectedAfterRevision)
+                .put("expectedTabId", expectedTabId ?: JSONObject.NULL)
+                .put("actualTabId", model.selectedTabId.value ?: JSONObject.NULL)
+                .put("controllerTabId", controller.tabId)
+                .put("actualPath", diagnosticPath(controller.url.value))
+                .put("committedPath", diagnosticPath(controller.committedUrl.value))
+                .put("actualTitle", controller.title.value.take(160))
+                .put("actualRevision", controller.committedRevision.value)
+                .put("loading", controller.isLoading.value)
+                .put("error", controller.error.value ?: JSONObject.NULL)
+                .put("secure", controller.isSecure.value)
+                .put("suspended", controller.suspendedState.value)
+                .put("closed", controller.closed)
+                .put("sessionOpen", controller.session.isOpen)
+                .put("viewportBound", findGecko(compose.activity.window.decorView, controller.session) != null)
+        }
+    }.getOrElse { JSONObject().put("diagnosticFailure", it.javaClass.simpleName) }
 
     private fun touchWebCentre() {
         Thread.sleep(350)
@@ -244,10 +296,14 @@ class EmulatorSoakTest {
         while (SystemClock.elapsedRealtime() < deadline) {
             if (condition()) return
             // Immediate errors should fail at the relevant operation instead of silently timing out.
-            if (phase != "activity_stopped" && model.controller.error.value != null) fail("Controlled page exposed an engine error during $phase")
+            if (phase != "activity_stopped" && model.controller.error.value != null) {
+                pageDiagnostic = capturePageDiagnostic()
+                fail("Controlled page exposed an engine error: $pageDiagnostic")
+            }
             Thread.sleep(100)
         }
-        fail(message)
+        pageDiagnostic = capturePageDiagnostic()
+        fail("$message; state=$pageDiagnostic")
     }
 
     private fun <T> onUi(action: () -> T): T = compose.runOnUiThread(action)
@@ -261,6 +317,8 @@ class EmulatorSoakTest {
             .put("status", status)
             .put("phase", phase)
             .put("requestedSeconds", requestedSeconds)
+            .put("plannedCycles", plannedCycleCount)
+            .put("plannedBackgrounds", plannedBackgroundCount)
             .put("elapsedMilliseconds", elapsed)
             .put("cycles", cycles)
             .put("foregroundNavigationRequests", navigationRequests)
@@ -275,6 +333,7 @@ class EmulatorSoakTest {
             .put("displayPowerAndAmbientCovered", false)
             .put("systemSettingsChanged", false)
             .put("failureClass", failureClass ?: JSONObject.NULL)
+            .put("pageDiagnostic", pageDiagnostic ?: JSONObject.NULL)
         Log.i("EmulatorSoak", summary.toString())
         val directory = instrumentation.targetContext.getExternalFilesDir(null) ?: return
         val text = summary.toString(2)

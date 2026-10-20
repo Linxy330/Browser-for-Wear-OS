@@ -283,8 +283,14 @@ private fun WebScreen(controller: TabSessionController, immersive: Boolean, acti
     val progress by controller.progress.collectAsState()
     val error by controller.error.collectAsState()
     val suspended by controller.suspendedState.collectAsState()
+    val currentSession by controller.sessionState.collectAsState()
+    val documentRevision by controller.committedRevision.collectAsState()
     var nativeView by remember { mutableStateOf<GeckoView?>(null) }
-    LaunchedEffect(active, suspended, nativeView) {
+    val releaseHooks = remember(controller) { mutableMapOf<GeckoView, () -> Unit>() }
+    LaunchedEffect(currentSession, documentRevision, nativeView) {
+        nativeView?.let(SingleHandZoom::forget)
+    }
+    LaunchedEffect(active, suspended, currentSession, nativeView) {
         if (active && !suspended) nativeView?.requestFocus()
     }
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
@@ -292,8 +298,10 @@ private fun WebScreen(controller: TabSessionController, immersive: Boolean, acti
         val webModifier = if (immersive) Modifier.fillMaxSize() else Modifier.size(side)
         AndroidView(factory = { context -> GeckoView(context).apply {
             setViewBackend(GeckoView.BACKEND_TEXTURE_VIEW)
-            if (!suspended && controller.session.isOpen) setSession(controller.session)
-            controller.onBeforeSuspend = { SingleHandZoom.cancel(this); if (session === controller.session) releaseSession() }
+            if (!suspended && currentSession.isOpen) setSession(currentSession)
+            val hook: () -> Unit = { SingleHandZoom.forget(this); releaseSession() }
+            releaseHooks[this] = hook
+            controller.onBeforeSuspend = hook
             setOnGenericMotionListener { _, event ->
                 if (event.action == MotionEvent.ACTION_SCROLL && event.isFromSource(InputDevice.SOURCE_ROTARY_ENCODER)) {
                     controller.scrollBy(-event.getAxisValue(MotionEvent.AXIS_SCROLL) * 48 * resources.displayMetrics.density); true
@@ -302,11 +310,20 @@ private fun WebScreen(controller: TabSessionController, immersive: Boolean, acti
             nativeView = this
             onView(this)
         } }, update = { view ->
-            if (!suspended && controller.session.isOpen && view.session !== controller.session) { view.releaseSession(); view.setSession(controller.session) }
-            controller.onBeforeSuspend = { SingleHandZoom.cancel(view); if (view.session === controller.session) view.releaseSession() }
+            if (!suspended && currentSession.isOpen && view.session !== currentSession) {
+                SingleHandZoom.forget(view)
+                view.releaseSession()
+                view.setSession(currentSession)
+            }
+            controller.onBeforeSuspend = releaseHooks[view]
             onView(view)
         },
-            onRelease = { view -> SingleHandZoom.cancel(view); if (view.session === controller.session) { view.releaseSession(); controller.onBeforeSuspend = null } }, modifier = webModifier.align(Alignment.Center))
+            onRelease = { view ->
+                SingleHandZoom.forget(view)
+                view.releaseSession()
+                val ownedHook = releaseHooks.remove(view)
+                if (controller.onBeforeSuspend === ownedHook) controller.onBeforeSuspend = null
+            }, modifier = webModifier.align(Alignment.Center))
         Text(text = if (loading) stringResource(R.string.b1_loading, progress) else title.ifEmpty { runCatching { URI(url).host }.getOrNull() ?: url },
             color = Color.White, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center,
             modifier = Modifier.align(Alignment.TopCenter).padding(top = 14.dp).fillMaxWidth(.50f).background(Color.Black).clickable(onClick = onAddress))

@@ -34,13 +34,18 @@ class TabSessionController(
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
     private val runtime: GeckoRuntime by lazy { GeckoRuntimeHolder.runtime(appContext) }
-    val session: GeckoSession = GeckoSession(
+    private fun createSession(): GeckoSession = GeckoSession(
         GeckoSessionSettings.Builder()
             .userAgentMode(GeckoSessionSettings.USER_AGENT_MODE_MOBILE)
             .viewportMode(GeckoSessionSettings.VIEWPORT_MODE_MOBILE)
             .suspendMediaWhenInactive(true)
             .build(),
     )
+
+    private val _session = MutableStateFlow(createSession())
+    val sessionState: StateFlow<GeckoSession> = _session.asStateFlow()
+    val session: GeckoSession get() = _session.value
+    private var pendingResume: Runnable? = null
 
     private val _url = MutableStateFlow("")
     val url: StateFlow<String> = _url.asStateFlow()
@@ -123,6 +128,7 @@ class TabSessionController(
     fun loadUri(uri: String) {
         checkMainThread()
         if (closed) return
+        cancelPendingResume()
         reopen(loadLastPage = false)
         if (!canOperate()) return
         resetLoadState()
@@ -142,6 +148,7 @@ class TabSessionController(
 
     fun stop() {
         checkMainThread()
+        cancelPendingResume()
         if (!canOperate()) return
         stoppedByUser = true
         _isLoading.value = false
@@ -198,6 +205,7 @@ class TabSessionController(
     fun suspendPage() {
         checkMainThread()
         if (closed || suspended || !session.isOpen) return
+        cancelPendingResume()
         setActive(false)
         onBeforeSuspend?.invoke()
         _suspended.value = true
@@ -211,7 +219,7 @@ class TabSessionController(
         session.close()
     }
 
-    /** Reopens the same Java session and performs a safe GET of the last committed URL. */
+    /** Builds a new native identity; logical tab ID and metadata remain unchanged. */
     fun resumePage() {
         checkMainThread()
         reopen(loadLastPage = true)
@@ -221,6 +229,7 @@ class TabSessionController(
         if (closed || !suspended) return
         _suspended.value = false
         generation++
+        _session.value = createSession()
         installDelegates()
         session.open(runtime)
         session.setActive(active)
@@ -228,16 +237,31 @@ class TabSessionController(
         val previous = _committedUrl.value
         if (loadLastPage && isWebUri(previous)) {
             resetLoadState()
-            session.loadUri(previous)
+            val resumedSession = session
+            val epoch = generation
+            // A tab selection may be followed by an explicit address in this UI turn.
+            // Let that newer navigation cancel the automatic GET before Gecko queues both.
+            pendingResume = Runnable {
+                pendingResume = null
+                if (current(epoch) && session === resumedSession && resumedSession.isOpen) {
+                    resumedSession.loadUri(previous)
+                }
+            }.also { mainHandler.post(it) }
         }
         // SessionState restore can replay POST or restore private form values. Deliberately
         // use a fresh GET: hibernation does not promise pending forms or back-stack recovery.
         lastSessionState = null
     }
 
+    private fun cancelPendingResume() {
+        pendingResume?.let(mainHandler::removeCallbacks)
+        pendingResume = null
+    }
+
     fun close() {
         checkMainThread()
         if (closed) return
+        cancelPendingResume()
         dismissPrompt()
         onBeforeSuspend?.invoke()
         closed = true
