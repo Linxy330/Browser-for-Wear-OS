@@ -68,8 +68,10 @@ android {
             signingConfig = signingConfigs.getByName("localRelease")
             testProguardFiles("proguard-android-test.pro")
             optimization {
-                enable = true
-                packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
+                // Partial dependency optimization on AGP 9.4 changes Kotlin
+                // package visibility across the unoptimized Gecko/application
+                // boundary. Ship the verified bytecode with release signing.
+                enable = false
             }
         }
     }
