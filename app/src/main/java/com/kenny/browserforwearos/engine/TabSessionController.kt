@@ -105,7 +105,9 @@ class TabSessionController(
     private var handledExternalResponse = false
     private var lastSuccessfulTitle = ""
     private var showingRestoredMetadata = false
-    private val preparedUploads = mutableListOf<PreparedUpload>()
+    private data class OwnedUpload(val lease: PreparedUpload, val document: Long)
+    private var documentGeneration = 0L
+    private val preparedUploads = mutableListOf<OwnedUpload>()
     private var authorizedWindow: Pair<String, Long>? = null
     var awaitingFilePicker: Boolean = false
         private set
@@ -340,9 +342,15 @@ class TabSessionController(
         releasePreparedUploads()
     }
 
-    private fun releasePreparedUploads() {
-        preparedUploads.forEach { it.close() }
-        preparedUploads.clear()
+    private fun releasePreparedUploads(beforeDocument: Long? = null) {
+        val iterator = preparedUploads.iterator()
+        while (iterator.hasNext()) {
+            val upload = iterator.next()
+            if (beforeDocument == null || upload.document < beforeDocument) {
+                iterator.remove()
+                upload.lease.close()
+            }
+        }
     }
 
     private fun completePrompt(pending: EnginePrompt, response: () -> GeckoSession.PromptDelegate.PromptResponse): Boolean {
@@ -421,8 +429,11 @@ class TabSessionController(
         }
         _pendingPrompt.value = null
         awaitingFilePicker = false
+        // Confirmation can trigger an onchange auto-submit. Capture the owning
+        // document before native callbacks can advance the navigation generation.
+        val ownerDocument = documentGeneration
         val accepted = completePrompt(pending) { pending.prompt.confirm(appContext, uris.toTypedArray()) }
-        if (accepted && prepared != null) preparedUploads.add(prepared) else prepared?.close()
+        if (accepted && prepared != null) preparedUploads.add(OwnedUpload(prepared, ownerDocument)) else prepared?.close()
         return accepted
     }
 
@@ -570,6 +581,9 @@ class TabSessionController(
             // the cold-start label before the user chooses to restore it.
             if (showingRestoredMetadata && displayUrl(url).isEmpty()) return
             showingRestoredMetadata = false
+            // Do not unlink old files here: a form POST can still be reading
+            // them until the subsequent document has finished loading.
+            documentGeneration++
             resetLoadState()
             _isLoading.value = displayUrl(url).isNotEmpty()
             _progress.value = 0
@@ -589,8 +603,9 @@ class TabSessionController(
             _progress.value = 100
             if (handledExternalResponse) return
             if (success && _error.value == null && isWebUri(_url.value)) {
-                // The prior document's upload body has finished before this stop.
-                releasePreparedUploads()
+                // A file selected while this document was still loading remains
+                // live in its DOM. Only an older document's upload has finished.
+                releasePreparedUploads(beforeDocument = documentGeneration)
                 lastSuccessfulTitle = _title.value
                 _committedUrl.value = _url.value
                 _committedRevision.value++
