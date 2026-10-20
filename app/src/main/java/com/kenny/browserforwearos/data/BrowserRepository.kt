@@ -91,9 +91,9 @@ class BrowserRepository(context: Context) {
     }
 }
 
-/** v0 (pre-versioned metadata) migrates to v1; unknown future schemas are isolated intact. */
+/** Earlier metadata migrates with reading defaults; future schemas are isolated intact. */
 internal object BrowserStateCodec {
-    private const val VERSION = 1
+    private const val VERSION = 2
 
     fun decode(json: String): BrowserSnapshot {
         val root = JSONObject(json)
@@ -109,11 +109,15 @@ internal object BrowserStateCodec {
         }
         return BrowserDataRules.sanitize(
             BrowserSnapshot(
-                tabs = objects("tabs").map { SavedTab(id(it), it.optString("url").takeIf(String::isNotEmpty), it.optString("title")) },
+                tabs = objects("tabs").map { SavedTab(id(it), it.optString("url").takeIf(String::isNotEmpty), it.optString("title"), it.optBoolean("desktop", false)) },
                 selectedTabId = root.optString("selectedTabId").takeIf(String::isNotEmpty),
                 bookmarks = objects("bookmarks").map { Bookmark(id(it), it.optString("url"), it.optString("title")) },
                 history = objects("history").map { HistoryEntry(id(it), it.optString("url"), it.optString("title"), it.optLong("visitedAt", 0)) },
                 searchEngine = runCatching { SearchEngine.valueOf(root.optString("searchEngine", "BING")) }.getOrDefault(SearchEngine.BING),
+                reading = ReadingPreferences(
+                    root.optJSONObject("reading")?.optInt("textPercent", 100) ?: 100,
+                    runCatching { PageColorScheme.valueOf(root.optJSONObject("reading")?.optString("colorScheme", "SYSTEM") ?: "SYSTEM") }.getOrDefault(PageColorScheme.SYSTEM),
+                ),
             ),
         )
     }
@@ -122,10 +126,12 @@ internal object BrowserStateCodec {
         val safe = BrowserDataRules.sanitize(snapshot)
         val root = JSONObject().put("version", VERSION)
             .put("searchEngine", safe.searchEngine.name)
+            .put("reading", JSONObject().put("textPercent", safe.reading.textPercent).put("colorScheme", safe.reading.colorScheme.name))
             .put("selectedTabId", safe.selectedTabId ?: JSONObject.NULL)
         root.put("tabs", JSONArray().apply {
             safe.tabs.forEach { tab ->
                 put(JSONObject().put("id", tab.id).apply {
+                    put("desktop", tab.desktop)
                     tab.url?.let { put("url", it); put("title", tab.title) }
                 })
             }

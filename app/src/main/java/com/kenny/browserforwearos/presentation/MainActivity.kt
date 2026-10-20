@@ -46,8 +46,11 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.wear.compose.material3.*
 import com.kenny.browserforwearos.R
 import com.kenny.browserforwearos.data.SearchEngine
+import com.kenny.browserforwearos.data.PageColorScheme
 import com.kenny.browserforwearos.engine.EnginePrompt
 import com.kenny.browserforwearos.engine.TabSessionController
+import com.kenny.browserforwearos.engine.DeviceActivityMonitor
+import com.kenny.browserforwearos.engine.ImeGeckoView
 import com.kenny.browserforwearos.presentation.theme.BrowserForWearOSTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -57,16 +60,35 @@ import kotlin.math.min
 
 class MainActivity : ComponentActivity() {
     private val viewModel: BrowserViewModel by viewModels()
+    private lateinit var activityMonitor: DeviceActivityMonitor
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
-        setContent { BrowserForWearOSTheme { BrowserNavHost(viewModel) } }
+        activityMonitor = DeviceActivityMonitor(this) { viewModel.setForeground(it) }
+        if (savedInstanceState == null) receiveIntent(intent)
+        setContent {
+            val ambient by activityMonitor.ambient.collectAsState()
+            BrowserForWearOSTheme {
+                Box(Modifier.fillMaxSize()) {
+                    BrowserNavHost(viewModel)
+                    if (ambient) ProductAmbientScreen()
+                }
+            }
+        }
     }
-    override fun onPause() { viewModel.setForeground(false); super.onPause() }
-    override fun onResume() { super.onResume(); viewModel.setForeground(true) }
+    override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); receiveIntent(intent) }
+    private fun receiveIntent(intent: Intent?) {
+        when (intent?.action) {
+            Intent.ACTION_VIEW -> intent.dataString?.let { viewModel.receiveIncoming(it, true) }
+            Intent.ACTION_SEND -> if (intent.type == "text/plain") intent.getStringExtra(Intent.EXTRA_TEXT)?.let { viewModel.receiveIncoming(it, false) }
+        }
+    }
+    override fun onPause() { activityMonitor.onPause(); super.onPause() }
+    override fun onResume() { super.onResume(); activityMonitor.onResume() }
+    override fun onDestroy() { activityMonitor.close(); super.onDestroy() }
 }
 
-private enum class Screen { Home, Address, Web, Menu, Tabs, Bookmarks, History, Settings, ClearData, EditBookmark }
+private enum class Screen { Home, Address, Web, Menu, Tabs, Bookmarks, History, Settings, ClearData, EditBookmark, Find, Reader, Downloads, About }
 
 @Composable
 fun BrowserNavHost(viewModel: BrowserViewModel) {
@@ -76,14 +98,45 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
     val bookmarks by viewModel.bookmarks.collectAsState()
     val history by viewModel.history.collectAsState()
     val search by viewModel.searchEngine.collectAsState()
+    val reading by viewModel.reading.collectAsState()
+    val incoming by viewModel.incoming.collectAsState()
+    val downloadOffer by viewModel.downloadOffer.collectAsState()
     var screen by rememberSaveable { mutableStateOf(Screen.Home) }
     var returnTo by rememberSaveable { mutableStateOf(Screen.Home) }
     var editingBookmark by rememberSaveable { mutableStateOf<String?>(null) }
     var immersive by rememberSaveable { mutableStateOf(false) }
     var viewport by remember { mutableStateOf<GeckoView?>(null) }
+    var incomingText by remember { mutableStateOf<String?>(null) }
     val controller = tabs.firstOrNull { it.id == selected }?.controller
     val keyboard = LocalSoftwareKeyboardController.current
-    LaunchedEffect(screen, selected, ready) { viewModel.setWebVisible(screen == Screen.Web) }
+    val scope = rememberCoroutineScope()
+    fun requestZoom(factor: Float?) {
+        val target = controller ?: return
+        screen = Screen.Web
+        scope.launch {
+            delay(250) // Let the menu leave and the fit viewport complete its native layout.
+            if (viewModel.controller !== target || screen != Screen.Web) return@launch
+            val result = if (factor == null) target.zoom.resetToFit() else target.zoom.zoomBy(factor)
+            result.accept { outcome ->
+                if (outcome?.outcome !in setOf(PageZoomController.Outcome.APPLIED, PageZoomController.Outcome.CANCELLED)) viewModel.showMessage(R.string.zoom_limited)
+            }
+        }
+    }
+    LaunchedEffect(incoming, ready) {
+        val request = incoming ?: return@LaunchedEffect
+        if (!ready) return@LaunchedEffect
+        if (request.openImmediately) {
+            val needsTab = controller?.url?.value?.isNotEmpty() == true || controller?.privateMode == true
+            if (needsTab && !viewModel.newTab()) {
+                incomingText = request.value; returnTo = if (screen == Screen.Address) returnTo else screen; screen = Screen.Address
+            } else if (viewModel.submitAddress(request.value)) screen = Screen.Web
+        } else {
+            incomingText = request.value; returnTo = if (screen == Screen.Address) returnTo else screen; screen = Screen.Address
+        }
+        viewModel.consumeIncoming(request.serial)
+    }
+    LaunchedEffect(downloadOffer) { if (downloadOffer > 0) screen = Screen.Downloads }
+    LaunchedEffect(screen, selected, ready) { viewModel.setWebVisible(screen == Screen.Web || screen == Screen.Find) }
     BackHandler(enabled = screen != Screen.Home) {
         when (screen) {
             Screen.Web -> {
@@ -91,10 +144,11 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
                 else if (controller?.canGoBack?.value == true) controller.goBack()
                 else screen = Screen.Home
             }
-            Screen.Address -> { keyboard?.hide(); screen = returnTo }
+            Screen.Address -> { incomingText = null; keyboard?.hide(); screen = returnTo }
             Screen.Menu -> screen = Screen.Web
             Screen.EditBookmark -> screen = Screen.Bookmarks
             Screen.ClearData -> screen = Screen.Settings
+            Screen.Find, Screen.Reader -> screen = Screen.Web
             else -> screen = Screen.Home
         }
     }
@@ -103,7 +157,7 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(stringResource(R.string.restoring)) }
             return@Box
         }
-        if (screen == Screen.Web || screen == Screen.Menu) {
+        if (screen == Screen.Web || screen == Screen.Menu || screen == Screen.Find) {
             key(controller.tabId) {
                 WebScreen(controller, immersive, screen == Screen.Web, { screen = Screen.Menu }, {
                     returnTo = Screen.Web; screen = Screen.Address
@@ -119,19 +173,22 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
                 item { Action(R.string.tabs) { screen = Screen.Tabs } }
                 item { Action(R.string.bookmarks) { screen = Screen.Bookmarks } }
                 item { Action(R.string.history) { screen = Screen.History } }
+                item { Action(R.string.downloads) { screen = Screen.Downloads } }
                 item { Action(R.string.settings) { screen = Screen.Settings } }
             }
-            Screen.Address -> AddressScreen(currentUrl,
-                onSubmit = { if (viewModel.submitAddress(it)) { keyboard?.hide(); screen = Screen.Web } },
-                onCancel = { keyboard?.hide(); screen = returnTo })
+            Screen.Address -> AddressScreen(incomingText ?: currentUrl,
+                onSubmit = { if (viewModel.submitAddress(it)) { incomingText = null; keyboard?.hide(); screen = Screen.Web } },
+                onCancel = { incomingText = null; keyboard?.hide(); screen = returnTo })
             Screen.Menu -> {
                 val back by controller.canGoBack.collectAsState()
                 val forward by controller.canGoForward.collectAsState()
                 val loading by controller.isLoading.collectAsState()
                 val url by controller.url.collectAsState()
                 val secure by controller.isSecure.collectAsState()
+                val desktop by controller.desktopMode.collectAsState()
                 RoundList {
                     item { PageTitle(stringResource(R.string.tools)) }
+                    if (controller.privateMode) item { Text(stringResource(R.string.private_notice), style = MaterialTheme.typography.bodySmall) }
                     item { Text(url, modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodySmall) }
                     item { Text(stringResource(if (secure) R.string.secure_connection else R.string.unconfirmed_connection), style = MaterialTheme.typography.bodySmall) }
                     item { Action(R.string.back_to_page) { screen = Screen.Web } }
@@ -140,10 +197,14 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
                     item { Action(R.string.go_forward, forward) { controller.goForward(); screen = Screen.Web } }
                     item { Action(if (loading) R.string.stop else R.string.reload) { if (loading) controller.stop() else controller.reload(); screen = Screen.Web } }
                     item { Action(R.string.tabs) { screen = Screen.Tabs } }
+                    item { Action(R.string.find_in_page) { screen = Screen.Find } }
+                    item { Action(R.string.reader_mode) { screen = Screen.Reader } }
+                    item { Action(R.string.downloads) { screen = Screen.Downloads } }
+                    item { Action(if (desktop) R.string.mobile_site else R.string.desktop_site) { controller.setDesktopMode(!desktop); screen = Screen.Web } }
                     item { Action(R.string.add_bookmark, url.startsWith("http")) { viewModel.addBookmark() } }
-                    item { Action(R.string.zoom_in) { viewport?.let { SingleHandZoom.zoom(it, 1.35f) }; screen = Screen.Web } }
-                    item { Action(R.string.zoom_out) { viewport?.let { SingleHandZoom.zoom(it, 1 / 1.35f) }; screen = Screen.Web } }
-                    item { Action(R.string.fit_screen) { immersive = false; viewport?.let { SingleHandZoom.reset(it) }; screen = Screen.Web } }
+                    item { Action(R.string.zoom_in) { requestZoom(1.35f) } }
+                    item { Action(R.string.zoom_out) { requestZoom(1 / 1.35f) } }
+                    item { Action(R.string.fit_screen) { immersive = false; requestZoom(null) } }
                     item { Action(R.string.immersive) { immersive = true; screen = Screen.Web } }
                     item { Action(R.string.b1_home) { screen = Screen.Home } }
                     item { Action(R.string.settings) { screen = Screen.Settings } }
@@ -152,6 +213,7 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
             Screen.Tabs -> RoundList {
                 item { PageTitle(stringResource(R.string.tabs_count, tabs.size)) }
                 item { Action(R.string.new_tab) { if (viewModel.newTab()) { returnTo = Screen.Tabs; screen = Screen.Address } } }
+                item { Action(R.string.new_private_tab) { if (viewModel.newTab(privateMode = true)) { returnTo = Screen.Tabs; screen = Screen.Address } } }
                 tabs.forEach { tab ->
                     item(key = tab.id) {
                         val title by tab.controller.title.collectAsState()
@@ -159,7 +221,7 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             val label = title.ifEmpty { url }.ifEmpty { stringResource(R.string.empty_tab) }
                             Button(onClick = { viewModel.selectTab(tab.id); screen = if (url.isEmpty()) Screen.Home else Screen.Web }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-                                Text((if (tab.id == selected) "• " else "") + label, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                                Text((if (tab.id == selected) "• " else "") + (if (tab.controller.privateMode) stringResource(R.string.private_prefix) else "") + label, maxLines = 3, overflow = TextOverflow.Ellipsis)
                             }
                             Action(R.string.close_tab) { viewModel.closeTab(tab.id) }
                         }
@@ -205,6 +267,20 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
                     Button(onClick = { viewModel.setSearchEngine(engine) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text((if (engine == search) "• " else "") + when(engine) { SearchEngine.BING -> "Bing"; SearchEngine.GOOGLE -> "Google"; SearchEngine.DUCKDUCKGO -> "DuckDuckGo" }) }
                 } }
                 item { Action(R.string.clear_site_data) { screen = Screen.ClearData } }
+                item { Text(stringResource(R.string.web_text_size, reading.textPercent)) }
+                listOf(75, 100, 125, 150, 175, 200).forEach { percent -> item {
+                    Button(onClick = { viewModel.setReading(reading.copy(textPercent = percent)) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                        Text((if (percent == reading.textPercent) "• " else "") + "$percent%")
+                    }
+                } }
+                item { Text(stringResource(R.string.page_appearance)) }
+                PageColorScheme.entries.forEach { scheme -> item {
+                    val name = when (scheme) { PageColorScheme.SYSTEM -> R.string.follow_system; PageColorScheme.LIGHT -> R.string.light_pages; PageColorScheme.DARK -> R.string.dark_pages }
+                    Button(onClick = { viewModel.setReading(reading.copy(colorScheme = scheme)) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                        Text((if (scheme == reading.colorScheme) "• " else "") + stringResource(name))
+                    }
+                } }
+                item { Action(R.string.about_browser) { screen = Screen.About } }
                 item { Action(R.string.b1_home) { screen = Screen.Home } }
             }
             Screen.ClearData -> RoundList {
@@ -214,6 +290,10 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
                 item { Action(R.string.b1_cancel) { screen = Screen.Settings } }
             }
             Screen.Web -> Unit
+            Screen.Find -> ProductFindScreen(controller) { screen = Screen.Web }
+            Screen.Reader -> ProductReaderScreen(controller) { screen = Screen.Web }
+            Screen.Downloads -> ProductDownloadScreen(viewModel) { screen = Screen.Home }
+            Screen.About -> ProductAboutScreen { screen = Screen.Settings }
         }
         val appFeedback by viewModel.feedback.collectAsState()
         val engineFeedback by controller.feedback.collectAsState()
@@ -223,13 +303,19 @@ fun BrowserNavHost(viewModel: BrowserViewModel) {
                 Text(message, textAlign = TextAlign.Center, modifier = Modifier.background(MaterialTheme.colorScheme.surfaceContainer, MaterialTheme.shapes.small).padding(12.dp))
             }
         }
-        EnginePromptDialogs(controller)
+        EnginePromptDialogs(controller, viewModel.downloadManager)
+        ProductContextActions(controller, onOpen = { url, newTab ->
+            val privateMode = controller.privateMode
+            if (!newTab || viewModel.newTab(privateMode)) {
+                if (viewModel.submitAddress(url)) screen = Screen.Web
+            }
+        })
     }
 }
 
 /** End padding lets every item move into the readable centre of a round display. */
 @Composable
-private fun RoundList(content: LazyListScope.() -> Unit) {
+internal fun RoundList(content: LazyListScope.() -> Unit) {
     val state = rememberLazyListState()
     val focus = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
@@ -243,10 +329,10 @@ private fun RoundList(content: LazyListScope.() -> Unit) {
 }
 
 @Composable
-private fun PageTitle(text: String) = Text(text, textAlign = TextAlign.Center, style = MaterialTheme.typography.titleMedium)
+internal fun PageTitle(text: String) = Text(text, textAlign = TextAlign.Center, style = MaterialTheme.typography.titleMedium)
 
 @Composable
-private fun Action(label: Int, enabled: Boolean = true, onClick: () -> Unit) {
+internal fun Action(label: Int, enabled: Boolean = true, onClick: () -> Unit) {
     Button(onClick = onClick, enabled = enabled, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(stringResource(label), textAlign = TextAlign.Center) }
 }
 
@@ -256,7 +342,7 @@ fun AddressScreen(initial: String = "", onSubmit: (String) -> Unit, onCancel: ()
 
 @Composable
 private fun EditorScreen(initial: String, title: String, voice: Boolean, onSubmit: (String) -> Unit, onCancel: () -> Unit) {
-    var text by rememberSaveable(initial) { mutableStateOf(initial) }
+    var text by remember(initial) { mutableStateOf(initial) }
     val context = LocalContext.current
     val speech = remember { Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM) }
     val canSpeak = remember { speech.resolveActivity(context.packageManager) != null }
@@ -284,22 +370,21 @@ private fun WebScreen(controller: TabSessionController, immersive: Boolean, acti
     val error by controller.error.collectAsState()
     val suspended by controller.suspendedState.collectAsState()
     val currentSession by controller.sessionState.collectAsState()
-    val documentRevision by controller.committedRevision.collectAsState()
+    val selection by controller.pageTools.selectionState.collectAsState()
+    val contextTarget by controller.pageTools.contextState.collectAsState()
+    val prompt by controller.pendingPrompt.collectAsState()
     var nativeView by remember { mutableStateOf<GeckoView?>(null) }
     val releaseHooks = remember(controller) { mutableMapOf<GeckoView, () -> Unit>() }
-    LaunchedEffect(currentSession, documentRevision, nativeView) {
-        nativeView?.let(SingleHandZoom::forget)
-    }
-    LaunchedEffect(active, suspended, currentSession, nativeView) {
-        if (active && !suspended) nativeView?.requestFocus()
+    LaunchedEffect(active, suspended, currentSession, nativeView, selection == null, contextTarget == null, prompt == null) {
+        if (active && !suspended && selection == null && contextTarget == null && prompt == null) nativeView?.requestFocus()
     }
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
         val side = min(maxWidth.value, maxHeight.value).dp * .68f
         val webModifier = if (immersive) Modifier.fillMaxSize() else Modifier.size(side)
-        AndroidView(factory = { context -> GeckoView(context).apply {
+        AndroidView(factory = { context -> ImeGeckoView(context).apply {
             setViewBackend(GeckoView.BACKEND_TEXTURE_VIEW)
-            if (!suspended && currentSession.isOpen) setSession(currentSession)
-            val hook: () -> Unit = { SingleHandZoom.forget(this); releaseSession() }
+            if (!suspended && currentSession.isOpen) { setSession(currentSession); controller.zoom.attach(this, currentSession) }
+            val hook: () -> Unit = { controller.zoom.detach(this); releaseSession() }
             releaseHooks[this] = hook
             controller.onBeforeSuspend = hook
             setOnGenericMotionListener { _, event ->
@@ -307,24 +392,26 @@ private fun WebScreen(controller: TabSessionController, immersive: Boolean, acti
                     controller.scrollBy(-event.getAxisValue(MotionEvent.AXIS_SCROLL) * 48 * resources.displayMetrics.density); true
                 } else false
             }
+            setOnTouchListener { _, event -> controller.zoom.observeTouch(event); false }
             nativeView = this
             onView(this)
         } }, update = { view ->
             if (!suspended && currentSession.isOpen && view.session !== currentSession) {
-                SingleHandZoom.forget(view)
+                controller.zoom.detach(view)
                 view.releaseSession()
                 view.setSession(currentSession)
+                controller.zoom.attach(view, currentSession)
             }
             controller.onBeforeSuspend = releaseHooks[view]
             onView(view)
         },
             onRelease = { view ->
-                SingleHandZoom.forget(view)
+                controller.zoom.detach(view)
                 view.releaseSession()
                 val ownedHook = releaseHooks.remove(view)
                 if (controller.onBeforeSuspend === ownedHook) controller.onBeforeSuspend = null
             }, modifier = webModifier.align(Alignment.Center))
-        Text(text = if (loading) stringResource(R.string.b1_loading, progress) else title.ifEmpty { runCatching { URI(url).host }.getOrNull() ?: url },
+        Text(text = (if (controller.privateMode) stringResource(R.string.private_prefix) else "") + if (loading) stringResource(R.string.b1_loading, progress) else title.ifEmpty { runCatching { URI(url).host }.getOrNull() ?: url },
             color = Color.White, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center,
             modifier = Modifier.align(Alignment.TopCenter).padding(top = 14.dp).fillMaxWidth(.50f).background(Color.Black).clickable(onClick = onAddress))
         error?.let { message ->
@@ -341,7 +428,7 @@ private fun WebScreen(controller: TabSessionController, immersive: Boolean, acti
 
 /** 引擎原生提示：alert/confirm/prompt/HTTP 认证/选择框/离开确认。 */
 @Composable
-fun EnginePromptDialogs(controller: TabSessionController) {
+fun EnginePromptDialogs(controller: TabSessionController, downloads: com.kenny.browserforwearos.data.download.BrowserDownloadManager? = null) {
     val prompt by controller.pendingPrompt.collectAsState()
     val current = prompt ?: return
 
@@ -575,5 +662,8 @@ fun EnginePromptDialogs(controller: TabSessionController) {
                 },
             )
         }
+        is EnginePrompt.File -> ProductFilePrompt(controller, current, downloads)
+        is EnginePrompt.DateTime -> ProductValuePrompt(controller, current)
+        is EnginePrompt.Color -> ProductValuePrompt(controller, current)
     }
 }

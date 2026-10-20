@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -21,8 +22,8 @@ android {
         applicationId = "com.kenny.browserforwearos"
         minSdk = 30
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0-dev"
+        versionCode = 100
+        versionName = "1.0.0"
         testInstrumentationRunner = "com.kenny.browserforwearos.EmulatorOnlyTestRunner"
 
     }
@@ -33,6 +34,19 @@ android {
     signingConfigs.getByName("debug") {
         // Keep this project's debug identity stable across isolated Android user homes.
         storeFile = rootProject.file("../Browser_Agent/private/debug.keystore")
+    }
+    val releasePropertiesFile = rootProject.file("../Browser_Agent/private/release-signing.properties")
+    signingConfigs.create("localRelease") {
+        if (releasePropertiesFile.isFile) {
+            val secrets = Properties().apply { releasePropertiesFile.inputStream().use(::load) }
+            storeFile = releasePropertiesFile.parentFile.resolve(secrets.getProperty("storeFile"))
+            storePassword = secrets.getProperty("storePassword")
+            keyAlias = secrets.getProperty("keyAlias")
+            keyPassword = secrets.getProperty("keyPassword")
+        }
+    }
+    testBuildType = providers.gradleProperty("browserTestBuildType").orElse("debug").get().also {
+        require(it in setOf("debug", "release")) { "Only debug or release instrumentation is supported" }
     }
     productFlavors {
         create("arm") {
@@ -51,6 +65,8 @@ android {
 
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("localRelease")
+            testProguardFiles("proguard-android-test.pro")
             optimization {
                 enable = true
                 packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
@@ -90,7 +106,7 @@ dependencies {
     implementation(libs.compose.material3)
     implementation(libs.compose.ui.tooling)
     implementation(libs.core.splashscreen)
-    implementation(libs.play.services.wearable)
+    implementation(libs.wear.ambient)
     implementation(libs.ui)
     implementation(libs.ui.graphics)
     implementation(libs.ui.tooling.preview)

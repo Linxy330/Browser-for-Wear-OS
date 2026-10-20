@@ -1,6 +1,5 @@
 <resources>
     <string name="app_name">Browser for Wear OS</string>
-    <string name="abi_label">ABI: %1$s</string>
     <string name="b1_open_web">Open web</string>
     <string name="b1_address_title">Address / search</string>
     <string name="b1_address_hint">Address or search terms</string>

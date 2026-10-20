@@ -82,7 +82,7 @@ class EmulatorProfileCodecTest {
         assertEquals(SearchEngine.BING, migrated.searchEngine)
 
         repository.save(migrated)
-        assertEquals(1, JSONObject(stateFile.readText()).getInt("version"))
+        assertEquals(2, JSONObject(stateFile.readText()).getInt("version"))
         val reread = repository.read()
         assertFalse(reread.recoveredCorruption)
         // Migration-generated IDs are stable once the migrated profile is written.
@@ -107,7 +107,7 @@ class EmulatorProfileCodecTest {
         )
         repository.save(expected)
         val encoded = JSONObject(stateFile.readText())
-        assertEquals(1, encoded.getInt("version"))
+        assertEquals(2, encoded.getInt("version"))
         assertEquals("stable-blank", encoded.getString("selectedTabId"))
         assertFalse("A blank tab must not store an empty or about URL", encoded.getJSONArray("tabs").getJSONObject(1).has("url"))
         val restored = repository.read()

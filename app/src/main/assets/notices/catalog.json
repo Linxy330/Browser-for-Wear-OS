@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "id": "gecko",
+      "titleEn": "GeckoView 158 · Mozilla and third-party notices",
+      "titleZh": "GeckoView 158 · Mozilla 与第三方许可",
+      "asset": "notices/gecko.json"
+    },
+    {
+      "id": "androidx",
+      "titleEn": "AndroidX / Wear Compose / Media3",
+      "titleZh": "AndroidX / Wear Compose / Media3",
+      "asset": "notices/androidx.json"
+    },
+    {
+      "id": "kotlin",
+      "titleEn": "Kotlin, coroutines and serialization",
+      "titleZh": "Kotlin、协程与序列化",
+      "asset": "notices/kotlin.json"
+    },
+    {
+      "id": "jvm",
+      "titleEn": "Other JVM dependencies",
+      "titleZh": "其他 JVM 依赖",
+      "asset": "notices/jvm.json"
+    },
+    {
+      "id": "google_play",
+      "titleEn": "Google Play services · bundled third-party notices",
+      "titleZh": "Google Play 服务 · 随附第三方声明",
+      "asset": "notices/google_play.json"
+    }
+  ]
+}

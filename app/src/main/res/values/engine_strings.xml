@@ -3,8 +3,6 @@
     <string name="engine_unknown_origin">Unknown site</string>
     <string name="engine_external_link_unsupported">Opening external apps or this link type is not supported.</string>
     <string name="engine_popup_blocked">Site popup blocked.</string>
-    <string name="engine_upload_unsupported">File upload is not supported in this version.</string>
-    <string name="engine_download_unsupported">File download is not supported in this version.</string>
     <string name="engine_error_certificate">A secure connection could not be verified. This page was blocked. Check the address or try another site.</string>
     <string name="engine_error_dns">The site address could not be found. Check the address and network, then retry.</string>
     <string name="engine_error_offline">The device is offline. Connect to a network, then retry.</string>

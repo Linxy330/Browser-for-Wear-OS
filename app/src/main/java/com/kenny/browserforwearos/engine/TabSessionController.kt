@@ -21,6 +21,9 @@ import org.mozilla.geckoview.ScreenLength
 import org.mozilla.geckoview.WebRequestError
 import org.mozilla.geckoview.WebResponse
 import java.util.UUID
+import com.kenny.browserforwearos.data.forms.FormValues
+import com.kenny.browserforwearos.data.download.PreparedUpload
+import com.kenny.browserforwearos.presentation.PageZoomController
 
 fun newTabId(): String = "tab-" + UUID.randomUUID().toString()
 
@@ -30,14 +33,22 @@ class TabSessionController(
     context: Context,
     val tabId: String = newTabId(),
     initiallyOpen: Boolean = true,
+    val privateMode: Boolean = false,
+    initialDesktop: Boolean = false,
 ) {
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
     private val runtime: GeckoRuntime by lazy { GeckoRuntimeHolder.runtime(appContext) }
+    val pageTools = PageTools()
+    val zoom = PageZoomController()
+    private var initialZoomAllowed = true
+    private val _desktopMode = MutableStateFlow(initialDesktop)
+    val desktopMode: StateFlow<Boolean> = _desktopMode.asStateFlow()
     private fun createSession(): GeckoSession = GeckoSession(
         GeckoSessionSettings.Builder()
-            .userAgentMode(GeckoSessionSettings.USER_AGENT_MODE_MOBILE)
-            .viewportMode(GeckoSessionSettings.VIEWPORT_MODE_MOBILE)
+            .userAgentMode(if (_desktopMode.value) GeckoSessionSettings.USER_AGENT_MODE_DESKTOP else GeckoSessionSettings.USER_AGENT_MODE_MOBILE)
+            .viewportMode(if (_desktopMode.value) GeckoSessionSettings.VIEWPORT_MODE_DESKTOP else GeckoSessionSettings.VIEWPORT_MODE_MOBILE)
+            .usePrivateMode(privateMode)
             .suspendMediaWhenInactive(true)
             .build(),
     )
@@ -81,6 +92,7 @@ class TabSessionController(
     var onCloseRequested: (() -> Unit)? = null
     /** The UI releases its GeckoView synchronously before native session closure. */
     var onBeforeSuspend: (() -> Unit)? = null
+    var onDownload: ((WebResponse) -> Unit)? = null
 
     var closed: Boolean = false
         private set
@@ -90,9 +102,13 @@ class TabSessionController(
     private var generation = 0L
     private var active = true
     private var stoppedByUser = false
+    private var handledExternalResponse = false
+    private var lastSuccessfulTitle = ""
+    private var showingRestoredMetadata = false
+    private val preparedUploads = mutableListOf<PreparedUpload>()
     private var authorizedWindow: Pair<String, Long>? = null
-    // Kept only in memory. Never serialize form/POST state or replay it during resume.
-    private var lastSessionState: GeckoSession.SessionState? = null
+    var awaitingFilePicker: Boolean = false
+        private set
 
     init {
         checkMainThread()
@@ -111,6 +127,12 @@ class TabSessionController(
         session.contentDelegate = ContentHandler(epoch)
         session.promptDelegate = PromptHandler(epoch)
         session.permissionDelegate = PermissionHandler()
+        pageTools.sessionChanged(appContext, session)
+        session.setCompositorScrollDelegate(object : GeckoSession.CompositorScrollDelegate {
+            override fun onScrollChanged(session: GeckoSession, position: GeckoSession.ScrollPositionUpdate) {
+                if (current(epoch)) zoom.viewportChanged(session, position.zoom)
+            }
+        })
     }
 
     private fun current(epoch: Long): Boolean = !closed && !suspended && epoch == generation
@@ -122,6 +144,7 @@ class TabSessionController(
         _isSecure.value = false
         _fullScreen.value = false
         stoppedByUser = false
+        handledExternalResponse = false
         authorizedWindow = null
     }
 
@@ -132,18 +155,37 @@ class TabSessionController(
         reopen(loadLastPage = false)
         if (!canOperate()) return
         resetLoadState()
+        initialZoomAllowed = true
         session.loadUri(uri)
     }
 
     fun reload() {
         checkMainThread()
         if (closed) return
-        val wasSuspended = suspended
-        resumePage()
-        if (!canOperate() || wasSuspended) return
+        if (suspended || !session.isOpen) {
+            val retry = _url.value.takeIf(::isWebUri) ?: _committedUrl.value.takeIf(::isWebUri)
+            cancelPendingResume()
+            // A renderer crash closes its session. Rebuild before honoring an explicit retry.
+            if (!suspended) _suspended.value = true
+            reopen(loadLastPage = false)
+            resetLoadState()
+            retry?.let { session.loadUri(it) }
+            return
+        }
+        if (!canOperate()) return
         val retryUri = _url.value.takeIf { _error.value != null && isWebUri(it) }
         resetLoadState()
         if (retryUri != null) session.loadUri(retryUri) else session.reload()
+    }
+
+    fun setDesktopMode(enabled: Boolean) {
+        checkMainThread()
+        if (closed || _desktopMode.value == enabled) return
+        _desktopMode.value = enabled
+        zoom.forgetBaseline(_url.value)
+        session.settings.userAgentMode = if (enabled) GeckoSessionSettings.USER_AGENT_MODE_DESKTOP else GeckoSessionSettings.USER_AGENT_MODE_MOBILE
+        session.settings.viewportMode = if (enabled) GeckoSessionSettings.VIEWPORT_MODE_DESKTOP else GeckoSessionSettings.VIEWPORT_MODE_MOBILE
+        if (_url.value.isNotEmpty()) reload()
     }
 
     fun stop() {
@@ -159,6 +201,7 @@ class TabSessionController(
         checkMainThread()
         if (!canOperate() || !_canGoBack.value) return
         resetLoadState()
+        initialZoomAllowed = false
         session.goBack()
     }
 
@@ -166,6 +209,7 @@ class TabSessionController(
         checkMainThread()
         if (!canOperate() || !_canGoForward.value) return
         resetLoadState()
+        initialZoomAllowed = false
         session.goForward()
     }
 
@@ -196,8 +240,7 @@ class TabSessionController(
         } else {
             session.setFocused(false)
             session.setActive(false)
-            session.flushSessionState()
-            dismissPrompt()
+            if (!awaitingFilePicker) dismissPrompt()
         }
     }
 
@@ -207,7 +250,9 @@ class TabSessionController(
         if (closed || suspended || !session.isOpen) return
         cancelPendingResume()
         setActive(false)
+        dismissPrompt()
         onBeforeSuspend?.invoke()
+        pageTools.onSessionSuspended()
         _suspended.value = true
         generation++
         authorizedWindow = null
@@ -217,6 +262,7 @@ class TabSessionController(
         _canGoBack.value = false
         _canGoForward.value = false
         session.close()
+        releasePreparedUploads()
     }
 
     /** Builds a new native identity; logical tab ID and metadata remain unchanged. */
@@ -227,6 +273,7 @@ class TabSessionController(
 
     private fun reopen(loadLastPage: Boolean) {
         if (closed || !suspended) return
+        releasePreparedUploads()
         _suspended.value = false
         generation++
         _session.value = createSession()
@@ -250,12 +297,28 @@ class TabSessionController(
         }
         // SessionState restore can replay POST or restore private form values. Deliberately
         // use a fresh GET: hibernation does not promise pending forms or back-stack recovery.
-        lastSessionState = null
     }
 
     private fun cancelPendingResume() {
         pendingResume?.let(mainHandler::removeCallbacks)
         pendingResume = null
+    }
+
+    private fun rendererUnavailable(message: Int) {
+        cancelPendingResume()
+        dismissPrompt()
+        onBeforeSuspend?.invoke()
+        pageTools.onSessionSuspended()
+        _suspended.value = true
+        generation++
+        _isLoading.value = false
+        _isSecure.value = false
+        _fullScreen.value = false
+        _canGoBack.value = false
+        _canGoForward.value = false
+        _error.value = appContext.getString(message)
+        if (session.isOpen) session.close()
+        releasePreparedUploads()
     }
 
     fun close() {
@@ -269,19 +332,34 @@ class TabSessionController(
         onNewTabRequested = null
         onCloseRequested = null
         onBeforeSuspend = null
+        onDownload = null
+        pageTools.close()
+        zoom.close()
         authorizedWindow = null
-        lastSessionState = null
         if (session.isOpen) session.close()
+        releasePreparedUploads()
     }
 
-    private fun completePrompt(pending: EnginePrompt, response: () -> GeckoSession.PromptDelegate.PromptResponse) {
+    private fun releasePreparedUploads() {
+        preparedUploads.forEach { it.close() }
+        preparedUploads.clear()
+    }
+
+    private fun completePrompt(pending: EnginePrompt, response: () -> GeckoSession.PromptDelegate.PromptResponse): Boolean {
         pending.basePrompt.setDelegate(null)
-        runCatching { pending.geckoResult.complete(response()) }
-            .onFailure { Log.w(TAG, "Prompt completion failed") }
+        return runCatching { pending.geckoResult.complete(response()) }.fold(
+            onSuccess = { true },
+            onFailure = { failure ->
+                runCatching { pending.geckoResult.completeExceptionally(failure) }
+                Log.w(TAG, "Prompt completion failed")
+                false
+            },
+        )
     }
 
     fun dismissPrompt() {
         checkMainThread()
+        awaitingFilePicker = false
         val pending = _pendingPrompt.value ?: return
         _pendingPrompt.value = null
         completePrompt(pending) { pending.basePrompt.dismiss() }
@@ -332,6 +410,49 @@ class TabSessionController(
         completePrompt(pending) { pending.prompt.confirm(AllowOrDeny.ALLOW) }
     }
 
+    fun confirmFiles(uris: List<Uri>, prepared: PreparedUpload? = null): Boolean {
+        checkMainThread()
+        val pending = _pendingPrompt.value as? EnginePrompt.File
+        if (pending == null || uris.isEmpty() || uris.size > 10 || uris.any { it.scheme != "file" } ||
+            (pending.prompt.type != GeckoSession.PromptDelegate.FilePrompt.Type.MULTIPLE && uris.size != 1) ||
+            (prepared != null && prepared.uris != uris)) {
+            prepared?.close()
+            return false
+        }
+        _pendingPrompt.value = null
+        awaitingFilePicker = false
+        val accepted = completePrompt(pending) { pending.prompt.confirm(appContext, uris.toTypedArray()) }
+        if (accepted && prepared != null) preparedUploads.add(prepared) else prepared?.close()
+        return accepted
+    }
+
+    fun beginFilePicker(): Boolean {
+        checkMainThread()
+        if (_pendingPrompt.value !is EnginePrompt.File) return false
+        awaitingFilePicker = true
+        return true
+    }
+
+    fun endFilePicker() { checkMainThread(); awaitingFilePicker = false }
+
+    fun confirmDateTime(value: String): Boolean {
+        checkMainThread()
+        val pending = _pendingPrompt.value as? EnginePrompt.DateTime ?: return false
+        if (!FormValues.validDateTime(value, pending.prompt.type, pending.prompt.minValue.orEmpty(), pending.prompt.maxValue.orEmpty(), pending.prompt.stepValue.orEmpty())) return false
+        _pendingPrompt.value = null
+        completePrompt(pending) { pending.prompt.confirm(value) }
+        return true
+    }
+
+    fun confirmColor(value: String): Boolean {
+        checkMainThread()
+        val pending = _pendingPrompt.value as? EnginePrompt.Color ?: return false
+        if (!FormValues.validColor(value)) return false
+        _pendingPrompt.value = null
+        completePrompt(pending) { pending.prompt.confirm(value.lowercase()) }
+        return true
+    }
+
     fun consumeFeedback() {
         checkMainThread()
         _feedback.value = null
@@ -344,6 +465,7 @@ class TabSessionController(
         if (!isWebUri(url)) return
         _url.value = url
         _title.value = title
+        showingRestoredMetadata = true
     }
 
     private fun notifyFeedback(resource: Int) {
@@ -369,6 +491,7 @@ class TabSessionController(
             hasUserGesture: Boolean,
         ) {
             if (!current(epoch) || url == null) return
+            if (showingRestoredMetadata && displayUrl(url).isEmpty()) return
             _url.value = displayUrl(url)
         }
 
@@ -420,6 +543,7 @@ class TabSessionController(
             session: GeckoSession, uri: String?, error: WebRequestError,
         ): GeckoResult<String> {
             if (!current(epoch)) return GeckoResult.fromValue(null)
+            if (handledExternalResponse) return GeckoResult.fromValue(null)
             _isLoading.value = false
             _isSecure.value = false
             _fullScreen.value = false
@@ -442,22 +566,35 @@ class TabSessionController(
     private inner class ProgressHandler(private val epoch: Long) : GeckoSession.ProgressDelegate {
         override fun onPageStart(session: GeckoSession, url: String) {
             if (!current(epoch)) return
+            // The new native session's initial blank document must not erase
+            // the cold-start label before the user chooses to restore it.
+            if (showingRestoredMetadata && displayUrl(url).isEmpty()) return
+            showingRestoredMetadata = false
             resetLoadState()
             _isLoading.value = displayUrl(url).isNotEmpty()
             _progress.value = 0
             _url.value = displayUrl(url)
             _title.value = ""
+            pageTools.onDocumentStarted(url)
+            zoom.documentStarted(url, session, initialZoomAllowed)
+            initialZoomAllowed = true
             session.setActive(active)
             session.setFocused(active)
         }
 
         override fun onPageStop(session: GeckoSession, success: Boolean) {
             if (!current(epoch)) return
+            if (showingRestoredMetadata) return
             _isLoading.value = false
             _progress.value = 100
+            if (handledExternalResponse) return
             if (success && _error.value == null && isWebUri(_url.value)) {
+                // The prior document's upload body has finished before this stop.
+                releasePreparedUploads()
+                lastSuccessfulTitle = _title.value
                 _committedUrl.value = _url.value
                 _committedRevision.value++
+                pageTools.onDocumentCommitted(_committedUrl.value, _title.value, _committedRevision.value)
             } else if (!success && !stoppedByUser && _error.value == null) {
                 _isSecure.value = false
                 _error.value = appContext.getString(R.string.engine_error_load)
@@ -476,32 +613,26 @@ class TabSessionController(
             }
         }
 
-        override fun onSessionStateChange(session: GeckoSession, sessionState: GeckoSession.SessionState) {
-            if (current(epoch)) lastSessionState = GeckoSession.SessionState(sessionState)
-        }
     }
 
     private inner class ContentHandler(private val epoch: Long) : GeckoSession.ContentDelegate {
+        override fun onFirstContentfulPaint(session: GeckoSession) {
+            if (current(epoch)) zoom.contentPainted(session)
+        }
         override fun onTitleChange(session: GeckoSession, title: String?) {
+            if (showingRestoredMetadata) return
             if (current(epoch)) _title.value = title.orEmpty().takeUnless { it.equals("about:blank", ignoreCase = true) }.orEmpty()
+            if (current(epoch) && !_isLoading.value && _url.value == _committedUrl.value) lastSuccessfulTitle = _title.value
         }
 
         override fun onCrash(session: GeckoSession) {
             if (!current(epoch)) return
-            dismissPrompt()
-            _isLoading.value = false
-            _isSecure.value = false
-            _fullScreen.value = false
-            _error.value = appContext.getString(R.string.engine_error_crash)
+            rendererUnavailable(R.string.engine_error_crash)
         }
 
         override fun onKill(session: GeckoSession) {
             if (!current(epoch)) return
-            dismissPrompt()
-            _isLoading.value = false
-            _isSecure.value = false
-            _fullScreen.value = false
-            _error.value = appContext.getString(R.string.engine_error_reclaimed)
+            rendererUnavailable(R.string.engine_error_reclaimed)
         }
 
         override fun onFocusRequest(session: GeckoSession) {
@@ -517,10 +648,20 @@ class TabSessionController(
         }
 
         override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
-            runCatching { response.body?.close() }
-            if (!current(epoch)) return
+            if (!current(epoch) || onDownload == null) { runCatching { response.body?.close() }; return }
             _isLoading.value = false
-            notifyFeedback(R.string.engine_download_unsupported)
+            handledExternalResponse = true
+            _error.value = null
+            _url.value = _committedUrl.value
+            _title.value = lastSuccessfulTitle
+            pageTools.onDocumentCommitted(_url.value, _title.value, _committedRevision.value)
+            zoom.documentStarted(_url.value, session, allowInitialBaseline = false)
+            zoom.contentPainted(session)
+            onDownload?.invoke(response)
+        }
+
+        override fun onContextMenu(session: GeckoSession, screenX: Int, screenY: Int, element: GeckoSession.ContentDelegate.ContextElement) {
+            if (current(epoch) && active) pageTools.showContextMenu(session, element)
         }
     }
 
@@ -554,8 +695,10 @@ class TabSessionController(
                 override fun onPromptDismiss(prompt: GeckoSession.PromptDelegate.BasePrompt) {
                     if (_pendingPrompt.value !== pending) return
                     _pendingPrompt.value = null
-                    prompt.setDelegate(null)
-                    runCatching { result.complete(null) }
+                    awaitingFilePicker = false
+                    // A GeckoResult containing null is not a dismiss response: the
+                    // native controller dispatches it and would dereference null.
+                    completePrompt(pending) { prompt.dismiss() }
                 }
 
                 override fun onPromptUpdate(prompt: GeckoSession.PromptDelegate.BasePrompt) {
@@ -569,6 +712,7 @@ class TabSessionController(
                     val finishCancellation = Runnable {
                         if (_pendingPrompt.value === pending) {
                             _pendingPrompt.value = null
+                            awaitingFilePicker = false
                             pending.basePrompt.setDelegate(null)
                             runCatching { pending.basePrompt.dismiss() }
                         }
@@ -598,8 +742,11 @@ class TabSessionController(
             queue { EnginePrompt.BeforeUnload(prompt, it) }
 
         override fun onFilePrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.FilePrompt): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
-            if (current(epoch)) notifyFeedback(R.string.engine_upload_unsupported)
-            return GeckoResult.fromValue(prompt.dismiss())
+            if (prompt.type == GeckoSession.PromptDelegate.FilePrompt.Type.FOLDER) {
+                if (current(epoch)) notifyFeedback(R.string.folder_upload_unsupported)
+                return GeckoResult.fromValue(prompt.dismiss())
+            }
+            return queue { EnginePrompt.File(prompt, it) }
         }
 
         override fun onPopupPrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.PopupPrompt): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
@@ -607,10 +754,8 @@ class TabSessionController(
             return GeckoResult.fromValue(prompt.confirm(AllowOrDeny.DENY))
         }
 
-        override fun onDateTimePrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.DateTimePrompt): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> =
-            GeckoResult.fromValue(prompt.dismiss())
-        override fun onColorPrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.ColorPrompt): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> =
-            GeckoResult.fromValue(prompt.dismiss())
+        override fun onDateTimePrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.DateTimePrompt) = queue { EnginePrompt.DateTime(prompt, it) }
+        override fun onColorPrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.ColorPrompt) = queue { EnginePrompt.Color(prompt, it) }
     }
 
     companion object {
@@ -633,4 +778,7 @@ sealed class EnginePrompt(
     class Auth(val prompt: GeckoSession.PromptDelegate.AuthPrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
     class Choice(val prompt: GeckoSession.PromptDelegate.ChoicePrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
     class BeforeUnload(val prompt: GeckoSession.PromptDelegate.BeforeUnloadPrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
+    class File(val prompt: GeckoSession.PromptDelegate.FilePrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
+    class DateTime(val prompt: GeckoSession.PromptDelegate.DateTimePrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
+    class Color(val prompt: GeckoSession.PromptDelegate.ColorPrompt, result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>) : EnginePrompt(prompt, result)
 }

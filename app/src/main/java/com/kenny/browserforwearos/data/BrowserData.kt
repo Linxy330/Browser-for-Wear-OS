@@ -7,7 +7,13 @@ data class Bookmark(val id: String, val url: String, val title: String)
 data class HistoryEntry(val id: String, val url: String, val title: String, val visitedAt: Long)
 
 /** A blank tab has no URL; an attempted or failed navigation is never a restore target. */
-data class SavedTab(val id: String, val url: String? = null, val title: String = "")
+data class SavedTab(val id: String, val url: String? = null, val title: String = "", val desktop: Boolean = false)
+
+enum class PageColorScheme { SYSTEM, LIGHT, DARK }
+
+data class ReadingPreferences(val textPercent: Int = 100, val colorScheme: PageColorScheme = PageColorScheme.SYSTEM) {
+    fun normalized() = copy(textPercent = textPercent.coerceIn(75, 200))
+}
 
 data class BrowserSnapshot(
     val tabs: List<SavedTab> = emptyList(),
@@ -15,6 +21,7 @@ data class BrowserSnapshot(
     val bookmarks: List<Bookmark> = emptyList(),
     val history: List<HistoryEntry> = emptyList(),
     val searchEngine: SearchEngine = SearchEngine.BING,
+    val reading: ReadingPreferences = ReadingPreferences(),
 )
 
 /** Shared invariants apply both at the file boundary and on every user mutation. */
@@ -46,6 +53,7 @@ object BrowserDataRules {
             selectedTabId = snapshot.selectedTabId?.takeIf { selected -> tabs.any { it.id == selected } } ?: tabs.firstOrNull()?.id,
             bookmarks = bookmarks,
             history = history,
+            reading = snapshot.reading.normalized(),
         )
     }
 

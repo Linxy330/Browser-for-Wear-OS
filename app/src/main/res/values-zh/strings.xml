@@ -1,6 +1,5 @@
 <resources>
     <string name="app_name">Browser for Wear OS</string>
-    <string name="abi_label">ABI：%1$s</string>
     <string name="b1_open_web">打开网页</string>
     <string name="b1_address_title">网址 / 搜索</string>
     <string name="b1_address_hint">输入网址或搜索词</string>

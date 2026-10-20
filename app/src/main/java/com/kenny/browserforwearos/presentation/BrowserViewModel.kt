@@ -13,9 +13,15 @@ import com.kenny.browserforwearos.data.HistoryEntry
 import com.kenny.browserforwearos.data.SavedTab
 import com.kenny.browserforwearos.data.SearchEngine
 import com.kenny.browserforwearos.data.TabMetadataState
+import com.kenny.browserforwearos.data.ReadingPreferences
+import com.kenny.browserforwearos.data.PageColorScheme
 import com.kenny.browserforwearos.engine.GeckoRuntimeHolder
 import com.kenny.browserforwearos.engine.TabSessionController
 import com.kenny.browserforwearos.engine.newTabId
+import com.kenny.browserforwearos.data.download.BrowserDownloadManager
+import com.kenny.browserforwearos.data.download.UploadStager
+import com.kenny.browserforwearos.data.download.GeckoDownloadFetcher
+import com.kenny.browserforwearos.data.download.DownloadEventType
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -32,13 +38,18 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.StorageController
+import org.mozilla.geckoview.GeckoRuntimeSettings
 
 data class BrowserTab(val id: String, val controller: TabSessionController)
+data class IncomingBrowserRequest(val value: String, val openImmediately: Boolean, val serial: Long)
 
 /** Owns three stable logical tabs. All Gecko operations stay on the main thread. */
 class BrowserViewModel(app: Application) : AndroidViewModel(app) {
     private val repository = BrowserRepository(app)
     private val firstController = TabSessionController(app)
+    val downloadManager = BrowserDownloadManager(app, viewModelScope, GeckoDownloadFetcher(GeckoRuntimeHolder.runtime(app)))
+    private val _downloadOffer = MutableStateFlow(0L)
+    val downloadOffer: StateFlow<Long> = _downloadOffer.asStateFlow()
     private val _tabs = MutableStateFlow(listOf(BrowserTab(firstController.tabId, firstController)))
     val tabs: StateFlow<List<BrowserTab>> = _tabs.asStateFlow()
     private val _selectedTabId = MutableStateFlow<String?>(firstController.tabId)
@@ -49,6 +60,11 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
     val history: StateFlow<List<HistoryEntry>> = _history.asStateFlow()
     private val _searchEngine = MutableStateFlow(SearchEngine.BING)
     val searchEngine: StateFlow<SearchEngine> = _searchEngine.asStateFlow()
+    private val _reading = MutableStateFlow(ReadingPreferences())
+    val reading: StateFlow<ReadingPreferences> = _reading.asStateFlow()
+    private val _incoming = MutableStateFlow<IncomingBrowserRequest?>(null)
+    val incoming: StateFlow<IncomingBrowserRequest?> = _incoming.asStateFlow()
+    private var incomingSerial = 0L
     private val _ready = MutableStateFlow(false)
     val ready: StateFlow<Boolean> = _ready.asStateFlow()
     private val _feedback = MutableStateFlow<String?>(null)
@@ -71,7 +87,20 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
     private var clearingSiteData = false
 
     init {
+        UploadStager(app).cleanupOrphans()
         firstController.setActive(false)
+        viewModelScope.launch {
+            downloadManager.events.collect { event ->
+                when (event.type) {
+                    DownloadEventType.OFFERED -> _downloadOffer.value++
+                    DownloadEventType.EXPORTED -> _feedback.value = message(R.string.download_exported)
+                    DownloadEventType.EXPORT_FAILED -> _feedback.value = message(R.string.download_export_failed)
+                    DownloadEventType.CAPACITY_REACHED -> _feedback.value = message(if (event.id == null) R.string.download_capacity else R.string.download_busy)
+                    DownloadEventType.FAILED -> if (event.id == null) _feedback.value = message(R.string.download_io_error)
+                    else -> Unit // Each transfer has its own visible status and error.
+                }
+            }
+        }
         storageScope.launch {
             // A single writer preserves order; rapidly changing engine titles coalesce safely.
             // Closing the ViewModel closes the channel, allowing the last atomic write to drain.
@@ -121,13 +150,13 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
         return true
     }
 
-    fun newTab(): Boolean {
+    fun newTab(privateMode: Boolean = false): Boolean {
         if (!_ready.value) return false
         if (_tabs.value.size >= BrowserDataRules.MAX_TABS) {
             _feedback.value = message(R.string.data_tab_limit)
             return false
         }
-        val added = createTab(newTabId())
+        val added = createTab(newTabId(), privateMode = privateMode)
         metadata = tabState().add(added.id)!!.tabs
         _tabs.value = _tabs.value + added
         _selectedTabId.value = added.id
@@ -167,6 +196,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setForeground(active: Boolean) {
         foreground = active
+        downloadManager.setForeground(active)
         applyActivity()
     }
 
@@ -174,6 +204,34 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
         if (!_ready.value) return
         _searchEngine.value = engine
         persist()
+    }
+
+    fun setReading(preferences: ReadingPreferences) {
+        if (!_ready.value) return
+        _reading.value = preferences.normalized()
+        applyReading()
+        persist()
+    }
+
+    private fun applyReading() {
+        val settings = GeckoRuntimeHolder.runtime(getApplication<Application>()).settings
+        settings.fontSizeFactor = _reading.value.textPercent / 100f
+        settings.preferredColorScheme = when (_reading.value.colorScheme) {
+            PageColorScheme.SYSTEM -> GeckoRuntimeSettings.COLOR_SCHEME_SYSTEM
+            PageColorScheme.LIGHT -> GeckoRuntimeSettings.COLOR_SCHEME_LIGHT
+            PageColorScheme.DARK -> GeckoRuntimeSettings.COLOR_SCHEME_DARK
+        }
+    }
+
+    fun receiveIncoming(value: String, openImmediately: Boolean) {
+        val bounded = value.trim().take(8_192)
+        if (bounded.isBlank()) return
+        if (openImmediately && AddressResolver.httpUrl(bounded) == null) return
+        _incoming.value = IncomingBrowserRequest(bounded, openImmediately, ++incomingSerial)
+    }
+
+    fun consumeIncoming(serial: Long) {
+        if (_incoming.value?.serial == serial) _incoming.value = null
     }
 
     fun addBookmark() {
@@ -243,6 +301,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
     fun consumeFeedback() {
         _feedback.value = null
     }
+    fun showMessage(resource: Int) { _feedback.value = message(resource) }
 
     private fun restore(snapshot: BrowserSnapshot) {
         val restored = BrowserDataRules.sanitize(snapshot)
@@ -253,8 +312,10 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
         _bookmarks.value = restored.bookmarks
         _history.value = restored.history
         _searchEngine.value = restored.searchEngine
+        _reading.value = restored.reading
+        applyReading()
         _tabs.value = metadata.map { saved ->
-            createTab(saved.id).also { tab -> saved.url?.let { tab.controller.seedMetadata(it, saved.title) } }
+            createTab(saved.id, desktop = saved.desktop).also { tab -> saved.url?.let { tab.controller.seedMetadata(it, saved.title) } }
         }
         _selectedTabId.value = restored.selectedTabId?.takeIf { id -> metadata.any { it.id == id } } ?: metadata.first().id
         // Restored background tabs stay blank until actually selected and shown.
@@ -262,25 +323,26 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
         metadata.forEach { saved -> saved.url?.let { pendingRestores[saved.id] = it } }
     }
 
-    private fun createTab(id: String, initiallyOpen: Boolean = true): BrowserTab {
-        val tab = BrowserTab(id, TabSessionController(getApplication<Application>(), id, initiallyOpen = initiallyOpen))
+    private fun createTab(id: String, initiallyOpen: Boolean = true, privateMode: Boolean = false, desktop: Boolean = false): BrowserTab {
+        val tab = BrowserTab(id, TabSessionController(getApplication<Application>(), id, initiallyOpen = initiallyOpen, privateMode = privateMode, initialDesktop = desktop))
         tab.controller.setActive(false)
+        tab.controller.onDownload = { response -> downloadManager.offer(response, privateMode = privateMode) }
         tab.controller.onNewTabRequested = { url ->
-            if (foreground && webVisible && !clearingSiteData && _selectedTabId.value == id) openRequestedTab(url) else null
+            if (foreground && webVisible && !clearingSiteData && _selectedTabId.value == id) openRequestedTab(url, privateMode) else null
         }
         tab.controller.onCloseRequested = { closeTab(id) }
         observe(tab)
         return tab
     }
 
-    private fun openRequestedTab(url: String): GeckoSession? {
+    private fun openRequestedTab(url: String, privateMode: Boolean): GeckoSession? {
         if (!_ready.value || AddressResolver.httpUrl(url) == null) return null
         if (_tabs.value.size >= BrowserDataRules.MAX_TABS) {
             _feedback.value = message(R.string.data_popup_tab_limit)
             return null
         }
         // Gecko owns opening the returned session and loading the popup target.
-        val added = createTab(newTabId(), initiallyOpen = false)
+        val added = createTab(newTabId(), initiallyOpen = false, privateMode = privateMode)
         metadata = tabState().add(added.id)!!.tabs
         _tabs.value = _tabs.value + added
         _selectedTabId.value = added.id
@@ -292,6 +354,13 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
     private fun observe(tab: BrowserTab) {
         observers[tab.id] = viewModelScope.launch {
             launch {
+                tab.controller.desktopMode.collect { desktop ->
+                    if (_tabs.value.none { it.id == tab.id }) return@collect
+                    metadata = metadata.map { if (it.id == tab.id) it.copy(desktop = desktop) else it }
+                    persist()
+                }
+            }
+            launch {
                 tab.controller.committedRevision.collect { revision ->
                     if (_tabs.value.none { it.id == tab.id } || revision == 0L) return@collect
                     val safe = AddressResolver.persistableUrl(tab.controller.committedUrl.value)
@@ -300,7 +369,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
                     } else {
                         val pageTitle = BrowserDataRules.title(tab.controller.title.value, safe)
                         metadata = metadata.map { if (it.id == tab.id) it.copy(url = safe, title = pageTitle) else it }
-                        _history.value = BrowserDataRules.recordHistory(_history.value, safe, pageTitle, System.currentTimeMillis())
+                        if (!tab.controller.privateMode) _history.value = BrowserDataRules.recordHistory(_history.value, safe, pageTitle, System.currentTimeMillis())
                     }
                     persist()
                 }
@@ -313,7 +382,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
                     val pageTitle = BrowserDataRules.title(title, safe)
                     metadata = metadata.map { if (it.id == tab.id) it.copy(url = safe, title = pageTitle) else it }
                     // A late title update never recreates deleted history or changes visit order.
-                    _history.value = _history.value.map { if (it.url == safe) it.copy(title = pageTitle) else it }
+                    if (!tab.controller.privateMode) _history.value = _history.value.map { if (it.url == safe) it.copy(title = pageTitle) else it }
                     persist()
                 }
             }
@@ -334,7 +403,11 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
             tab.controller.setActive(active)
             // Hidden foreground pages get a bounded grace period for menus/address editing.
             val canSleep = !active
-            val gracePeriod = if (foreground && tab.id == _selectedTabId.value) HIDDEN_PAGE_SLEEP_DELAY_MS else BACKGROUND_SLEEP_DELAY_MS
+            val gracePeriod = when {
+                tab.controller.awaitingFilePicker -> FILE_PICKER_SLEEP_DELAY_MS
+                foreground && tab.id == _selectedTabId.value -> HIDDEN_PAGE_SLEEP_DELAY_MS
+                else -> BACKGROUND_SLEEP_DELAY_MS
+            }
             if (canSleep && (inactiveJobs[tab.id]?.isActive != true || inactiveDelays[tab.id] != gracePeriod)) {
                 inactiveJobs.remove(tab.id)?.cancel()
                 inactiveDelays[tab.id] = gracePeriod
@@ -357,7 +430,11 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
     private fun persist() {
         if (!_ready.value) return
         val pending = PendingWrite(
-            BrowserSnapshot(metadata, _selectedTabId.value, _bookmarks.value, _history.value, _searchEngine.value),
+            BrowserSnapshot(
+                metadata.filter { saved -> _tabs.value.any { it.id == saved.id && !it.controller.privateMode } },
+                _selectedTabId.value.takeIf { id -> _tabs.value.any { it.id == id && !it.controller.privateMode } },
+                _bookmarks.value, _history.value, _searchEngine.value, _reading.value,
+            ),
             repository.pendingWrite(),
         )
         if (writes.trySend(pending).isFailure) pending.finished.complete(Unit)
@@ -367,6 +444,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
         inactiveJobs.values.forEach { it.cancel() }
         observers.values.forEach { it.cancel() }
         _tabs.value.forEach { it.controller.close() }
+        downloadManager.close()
         writes.close()
         super.onCleared()
     }
@@ -374,6 +452,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         private const val BACKGROUND_SLEEP_DELAY_MS = 5_000L
         private const val HIDDEN_PAGE_SLEEP_DELAY_MS = 30_000L
+        private const val FILE_PICKER_SLEEP_DELAY_MS = 120_000L
 
         fun normalizeInput(input: String): String? = AddressResolver.resolve(input)
     }
